@@ -6,10 +6,8 @@ requires-python = ">=3.10"
 dependencies = [
     "typer",
     "rich",
-    "pillow>=12.3.0",
-    "pytest>=9.2.0",
 ]
-dev-dependencies = ["pytest"]
+dev-dependencies = ["pytest", "pillow"]
 
 [project.scripts]
 boaz = "main:app"
