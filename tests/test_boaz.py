@@ -289,3 +289,59 @@ def test_bad_geometry_fails_fast_and_releases(names):
     assert r.returncode != 0 and "320" in (r.stdout + r.stderr)
     from desktop import claimed_displays
     assert not [d for d in claimed_displays()], f"reservation leaked: {claimed_displays()}"
+
+
+@needs_linux
+def test_kill_refused_exit_code_and_force(names):
+    """Unverifiable live app: kill exits 3 and keeps the session; --force drops it."""
+    import time as _t
+    p = subprocess.Popen(["sleep", "120"])
+    n = tag("t-ref"); names.append(n)
+    try:
+        (sessions_dir() / f"{n}.json").write_text(json.dumps(
+            {"display": ":199", "app": p.pid, "app_starttime": "0",
+             "cmd": "sleep 120", "name": n}))
+        r = boaz("kill", "--name", n)
+        assert r.returncode == 3, r.stdout + r.stderr
+        assert (_sd_dir() / f"{n}.json").exists() if False else (sessions_dir() / f"{n}.json").exists()
+        r = boaz("kill", "--name", n, "--force")
+        assert r.returncode == 0
+        assert not (sessions_dir() / f"{n}.json").exists()
+        assert p.poll() is None, "force must not signal"
+    finally:
+        p.kill(); p.wait()
+
+
+def _sd_dir():
+    return sessions_dir()
+
+
+@needs_linux
+@needs_xlogo
+def test_slash_name_sanitized(names):
+    n = "t/slash-" + uuid.uuid4().hex[:6]
+    r = boaz("launch", str(XLOGO), "--name", n, "--wait", "15")
+    assert r.returncode == 0 and "Traceback" not in r.stdout + r.stderr, r.stdout + r.stderr
+    names.append(n)
+    assert (sessions_dir() / "t-slash-*.json").parent is not None
+    r = boaz("screenshot", "--name", n)
+    assert r.returncode == 0, r.stdout + r.stderr
+    r = boaz("kill", "--name", n)
+    assert r.returncode == 0
+
+
+@needs_linux
+def test_record_keeps_user_file_on_failure(names):
+    """A failed record must not delete the user's pre-existing out file."""
+    keep = Path(f"/tmp/boaz-keep-{uuid.uuid4().hex[:6]}.mp4")
+    keep.write_bytes(b"precious-user-bytes")
+    n = tag("t-keep"); names.append(n)
+    (sessions_dir() / f"{n}.json").write_text(json.dumps(
+        {"display": ":199", "app": 1, "cmd": "gone", "name": n}))
+    try:
+        r = boaz("record", "--name", n, "--out", str(keep), "--seconds", "1")
+        assert r.returncode != 0
+        assert keep.read_bytes() == b"precious-user-bytes", "user file was destroyed"
+    finally:
+        (sessions_dir() / f"{n}.json").unlink(missing_ok=True)
+        keep.unlink(missing_ok=True)

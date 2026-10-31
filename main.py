@@ -53,7 +53,7 @@ def _shot(name: str, out: str | None = None) -> str:
     st = need_session(name)
     if out is None:
         n = len(list(_shots_dir().glob(f"{name}-*.png")))
-        out = str(_shots_dir() / f"{name}-{n:03d}.png")
+        out = str(_shots_dir() / f"{name}-{n + 1:03d}.png")
     return str(capture(st["display"], Path(out)))
 
 
@@ -100,16 +100,24 @@ def launch(
         release_display(num)
         raise
     confirm_display(num)
-    log = Path(f"/tmp/boaz-{name}.log")
-    with log.open("wb") as lf:
-        proc = subprocess.Popen(cmd, shell=True, env=display_env(display),
-                                stdout=lf, stderr=subprocess.STDOUT,
-                                start_new_session=True)  # own process group: kill takes children too
-    from desktop import boot_id as _boot
-    save(name, {"xvfb": xvfb.pid, "xvfb_starttime": proc_stat_starttime(xvfb.pid),
-                "app": proc.pid, "app_starttime": proc_stat_starttime(proc.pid),
-                "boot_id": _boot(),
-                "cmd": cmd, "display": display, "name": name})
+    log = Path(f"/tmp/boaz-{Path(session_path(name)).stem}.log")
+    try:
+        with log.open("wb") as lf:
+            proc = subprocess.Popen(cmd, shell=True, env=display_env(display),
+                                    stdout=lf, stderr=subprocess.STDOUT,
+                                    start_new_session=True)  # own process group: kill takes children too
+        from desktop import boot_id as _boot
+        save(name, {"xvfb": xvfb.pid, "xvfb_starttime": proc_stat_starttime(xvfb.pid),
+                    "app": proc.pid, "app_starttime": proc_stat_starttime(proc.pid),
+                    "boot_id": _boot(),
+                    "cmd": cmd, "display": display, "name": name})
+    except BaseException:
+        try:
+            xvfb.kill()
+        except OSError:
+            pass
+        drop_session(name)
+        raise
     try:
         wid = wait_for_window(display, timeout=wait)
     except SystemExit as e:
@@ -220,13 +228,22 @@ def record(
     out = out or str(_shots_dir() / f"{name}.mp4")
     if Path(out).is_dir():
         raise SystemExit(f"cannot write {out}: is a directory")
+    if not (0 < seconds <= 3600):
+        raise SystemExit(f"bad --seconds={seconds}: want 0-3600")
     try:
         Path(out).parent.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         raise SystemExit(f"cannot write {out}: {e}")
     tmp_out = out + '.tmp.mp4'
-    Path(tmp_out).unlink(missing_ok=True)
-    errlog = Path(f"/tmp/boaz-{name}-ff.log")
+    if Path(tmp_out).is_dir():
+        raise SystemExit(f"cannot write {tmp_out}: is a directory")
+    try:
+        Path(tmp_out).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        raise SystemExit(f"cannot write {tmp_out}: {e}")
+    errlog = Path(f"/tmp/boaz-{Path(session_path(name)).stem}-ff.log")
     with errlog.open("wb") as ef:
         ff = subprocess.Popen(
             ["ffmpeg", "-y", "-f", "x11grab", "-draw_mouse", "0", "-r", "10", "-i", st["display"],
@@ -243,15 +260,19 @@ def record(
             ff.terminate()
             ff.wait()
         if script and not script_ok:
+            try:
+                Path(tmp_out).unlink()
+            except OSError:
+                pass
             raise SystemExit(f"record aborted: script {script} FAILED, no MP4 verified")
     frames = subprocess.run(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
                              "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", tmp_out],
                             capture_output=True, text=True)
     n = frames.stdout.strip()
     def _fail(msg: str) -> None:
+        # Only tmp_out is ever disowned: out may be the user's pre-existing file.
         try:
-            Path(tmp_out).unlink()  # never leave a file we disown
-            Path(out).unlink()
+            Path(tmp_out).unlink()
         except OSError:
             pass
         tail = errlog.read_text(errors="replace")[-500:] if errlog.exists() else ""
@@ -305,7 +326,9 @@ def kill(name: str = typer.Option("app", help="Session name (or --all)"),
          quiet: bool = typer.Option(False, help="No output")) -> None:
     """Kill headless session(s). Verifies cmdline+starttime — never kills strangers."""
     _require_linux("kill")
-    _kill([p.stem for p in sessions_dir().glob("*.json")] if all else [name], sweep, force, quiet)
+    kept = _kill([p.stem for p in sessions_dir().glob("*.json")] if all else [name], sweep, force, quiet)
+    if kept:
+        raise typer.Exit(3)
 
 
 def _cmd(st: dict) -> str:
@@ -326,14 +349,20 @@ def _app_is_ours(pid: int, st: dict) -> bool:
     return bool(cmd and cmd[:40] in proc_cmdline(pid))
 
 
-def _coerce_pids(st: dict) -> tuple[int | None, int | None]:
-    """Valid JSON with wrong types must not traceback the recovery commands."""
+def _coerce_pid(v) -> int | None:
+    if v is None or isinstance(v, bool):
+        return None
     try:
-        app = int(st.get("app")) if st.get("app") is not None else None
-        x = int(st.get("xvfb")) if st.get("xvfb") is not None else None
+        return int(v)
     except (TypeError, ValueError):
-        return None, None
-    return app, x
+        return None
+
+
+def _coerce_pids(st: dict) -> tuple[int | None, int | None]:
+    """Valid JSON with wrong types must not traceback the recovery commands.
+    Each field coerces independently: a corrupt xvfb must never discard a
+    verifiable live app (D1)."""
+    return _coerce_pid(st.get("app")), _coerce_pid(st.get("xvfb"))
 
 
 def _kill(names: list[str], sweep: bool, force: bool, quiet: bool) -> list[str]:
@@ -355,11 +384,20 @@ def _kill(names: list[str], sweep: bool, force: bool, quiet: bool) -> list[str]:
         app_pid, xvfb_pid = _coerce_pids(st)
         if (app_pid is None and xvfb_pid is None
                 and (st.get("app") is not None or st.get("xvfb") is not None)):
-            # Wholly unverifiable: only safe if nothing is alive under those names.
+            # Wholly unverifiable: clear only when nothing could be alive.
+            # (PIDs are ints here; non-int garbage can't be resolved to a proc.)
+            raw_app, raw_x = st.get("app"), st.get("xvfb")
+            maybe_alive = any(isinstance(v, int) and not isinstance(v, bool)
+                              and proc_cmdline(v) for v in (raw_app, raw_x))
+            if maybe_alive:
+                kept.append(n)
+                if not quiet:
+                    rprint(f"[dim]{n}: corrupt pids but a process may be alive — kept. Use --force to drop.[/]")
+                continue
             try:
                 Path(session_path(n)).unlink()
                 if not quiet:
-                    rprint(f"[dim]{n}: wrong-typed session file cleared.[/]")
+                    rprint(f"[dim]{n}: wrong-typed session file cleared (nothing alive).[/]")
             except OSError:
                 pass
             continue
@@ -380,10 +418,9 @@ def _kill(names: list[str], sweep: bool, force: bool, quiet: bool) -> list[str]:
         if app_pid and proc_cmdline(app_pid):
             if _app_is_ours(app_pid, st):
                 if verified_kill(app_pid, _cmd(st)[:40], st.get("app_starttime", "")):
-                    try:
-                        os.killpg(app_pid, signal.SIGTERM)
-                    except (ProcessLookupError, PermissionError, OSError):
-                        pass
+                    from desktop import kill_group as _kg
+                    for survivor in _kg(app_pid):
+                        leftovers.append(f"group member pid={survivor}")
                 if proc_cmdline(app_pid):
                     leftovers.append(f"app pid={app_pid}")
             else:
@@ -402,6 +439,15 @@ def _kill(names: list[str], sweep: bool, force: bool, quiet: bool) -> list[str]:
             continue
         drop_session(n)
     if sweep:
+        # Reclaim dead X-lock files too (stale SIGKILL residue with no live pid).
+        for lk in Path("/tmp").glob(".X*-lock"):
+            try:
+                pid_txt = lk.read_text().strip().split()[0]
+                int(pid_txt)
+                if not Path(f"/proc/{pid_txt}").exists():
+                    lk.unlink()
+            except (OSError, IndexError, ValueError):
+                pass
         for r in sessions_dir().glob(".reserve-*"):
             try:
                 r.unlink()

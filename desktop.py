@@ -30,8 +30,8 @@ def sessions_dir() -> Path:
     return d
 
 
-SESSIONS = sessions_dir()
-ALLOC_LOCK = sessions_dir().parent / ".alloc.lock"
+def alloc_lock() -> Path:
+    return sessions_dir().parent / ".alloc.lock"
 
 FIRST_DISPLAY = 99
 LAST_DISPLAY = 110
@@ -121,12 +121,16 @@ def display_taken(num: int) -> bool:
     if Path(f"/tmp/.X11-unix/X{num}").exists():
         return True
     try:
-        lock_pid = Path(f"/tmp/.X{num}-lock").read_text().split()[1]
+        lock_pid = Path(f"/tmp/.X{num}-lock").read_text().strip().split()[0]
+        int(lock_pid)  # garbage content: not a real lock
+    except FileNotFoundError:
+        pass  # no lock file: fall through to the socket probes
+    except (OSError, IndexError, ValueError):
+        return True  # unreadable lock: conservative, treat as taken
+    else:
         if not Path(f"/proc/{lock_pid}").exists():
             return False  # stale lock from a SIGKILLed server; Xvfb itself ignores it
         return True
-    except (OSError, IndexError):
-        pass
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(0.3)
@@ -168,8 +172,9 @@ def claimed_displays() -> set[int]:
 
 def alloc_display() -> int:
     """Locked allocation: flock + live session files + socket probes."""
-    ALLOC_LOCK.touch(exist_ok=True)
-    with open(ALLOC_LOCK, "w") as lock:
+    lock_path = alloc_lock()
+    lock_path.touch(exist_ok=True)
+    with open(lock_path, "w") as lock:
         if fcntl is not None:
             fcntl.flock(lock, fcntl.LOCK_EX)
         try:
@@ -230,7 +235,8 @@ def proc_cmdline(pid: int) -> str:
 
 def verified_kill(pid: int, expect: str, starttime: str = "") -> bool:
     """Kill pid only if cmdline still contains `expect` (non-empty) and the
-    starttime matches when given. Catches PermissionError. Never kills strangers."""
+    starttime matches when given. Catches PermissionError. Never kills strangers.
+    Escalates TERM -> KILL so TERM-ignoring processes don't survive (D8)."""
     if not expect or not expect.strip():
         return False
     cmd = proc_cmdline(pid)
@@ -238,21 +244,48 @@ def verified_kill(pid: int, expect: str, starttime: str = "") -> bool:
         return False
     if starttime and proc_stat_starttime(pid) != starttime:
         return False  # PID recycled onto a same-command process
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return False
-    for _ in range(20):
-        time.sleep(0.25)
-        if not proc_cmdline(pid):
-            return True
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            return sig == signal.SIGTERM or not proc_cmdline(pid)
+        except PermissionError:
+            return False
+        for _ in range(20):
+            time.sleep(0.25)
+            if not proc_cmdline(pid):
+                return True
     return not proc_cmdline(pid)
+
+
+def pids_in_group(pgid: int) -> list[int]:
+    """Live PIDs whose process group is pgid (children that outlived the leader)."""
+    out: list[int] = []
+    for p in Path("/proc").glob("[0-9]*"):
+        try:
+            parts = (p / "stat").read_text().rsplit(")", 1)[1].split()
+            if int(parts[3]) == pgid and int(p.name) != pgid:
+                out.append(int(p.name))
+        except (OSError, IndexError, ValueError):
+            continue
+    return out
+
+
+def kill_group(pgid: int) -> list[int]:
+    """TERM, grace, KILL the whole group; return surviving member PIDs (D8)."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        for _ in range(20):
+            time.sleep(0.25)
+            if not pids_in_group(pgid) and not proc_cmdline(pgid):
+                return []
+    left = pids_in_group(pgid)
+    if proc_cmdline(pgid):
+        left.append(pgid)
+    return left
 
 
 def wait_for_window(display: str, timeout: float = 30.0) -> str:
