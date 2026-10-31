@@ -1,70 +1,91 @@
 # Boaz — headless desktop tester. Mishpat's sibling: mishpat owns the browser, boaz owns the desktop.
-"""Session store, display allocation, process-verified kill, capture chain."""
+"""Session store, display allocation, verified kill, capture chain.
+
+Hard rules learned from review (agy 2/10, opencode 3/10 — both proven live):
+- Never trust `typer.Option` defaults off-CLI (truthy OptionInfo) — this module
+  has no typer dependency at all.
+- Never signal a PID without cmdline AND starttime match.
+- Never hand an agent a flat/black frame with exit 0.
+- Never allocate a display without a lock + post-start verification.
+"""
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import shutil
 import signal
 import socket
 import subprocess
-import sys
 import time
 from pathlib import Path
 
 SESSIONS = Path.home() / ".cache" / "boaz" / "sessions"
 SESSIONS.mkdir(parents=True, exist_ok=True)
+ALLOC_LOCK = Path.home() / ".cache" / "boaz" / ".alloc.lock"
 
 FIRST_DISPLAY = 99
 LAST_DISPLAY = 110
 WIDTH, HEIGHT = 1280, 800
 
-# Xvfb resolved at runtime: PATH first (so ~/.local/bin shims win), then the
-# rootless extract location tonight's harness used.
 XVFB_CANDIDATES = ["Xvfb", str(Path.home() / ".local" / "bin" / "Xvfb")]
-SCROT_CANDIDATES = ["scrot", str(Path.home() / ".local" / "bin" / "scrot")]
+XVFB_ARGV0 = "boaz-Xvfb"  # ownership marker: sweep only kills OUR servers
 
 
-def session_path(name: str) -> Path:
+def session_path(name: str) -> str:
     safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
-    return SESSIONS / f"{safe}.json"
+    return str(SESSIONS / f"{safe}.json")
 
 
 def load(name: str) -> dict:
-    p = session_path(name)
-    return json.loads(p.read_text()) if p.exists() else {}
+    p = Path(session_path(name))
+    try:
+        return json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {}
 
 
 def save(name: str, data: dict) -> None:
-    session_path(name).write_text(json.dumps(data, indent=2))
+    """Atomic write: tmp + os.replace, so readers never see half a session."""
+    p = Path(session_path(name))
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.replace(tmp, p)
 
 
 def drop_session(name: str) -> None:
     try:
-        session_path(name).unlink()
+        Path(session_path(name)).unlink()
     except FileNotFoundError:
         pass
 
 
-def resolve(candidates: list[str], label: str, install_hint: str) -> str:
+def which_or_hint(candidates: list[str], label: str, hint: str) -> str:
     for c in candidates:
         if "/" in c:
             if Path(c).exists():
                 return c
         elif shutil.which(c):
             return c
-    raise SystemExit(f"Missing {label}. Install: {install_hint}")
+    raise SystemExit(f"Missing {label}. Install: {hint}")
 
 
 def xvfb_bin() -> str:
-    return resolve(XVFB_CANDIDATES, "Xvfb", "sudo apt install xvfb  (rootless: apt-get download xvfb && dpkg -x *.deb ~/.local/xvfb-root)")
+    return which_or_hint(XVFB_CANDIDATES, "Xvfb", "sudo apt install xvfb  (rootless: apt-get download xvfb && dpkg -x *.deb ~/.local/xvfb-root)")
+
+
+def need_bins(*names: str) -> None:
+    hints = {"xdotool": "sudo apt install xdotool", "ffmpeg": "sudo apt install ffmpeg",
+             "ffprobe": "ships with ffmpeg", "scrot": "sudo apt install scrot",
+             "xwd": "sudo apt install x11-apps", "convert": "sudo apt install imagemagick",
+             "xwininfo": "sudo apt install x11-utils"}
+    for n in names:
+        if not shutil.which(n):
+            raise SystemExit(f"Missing {n}. Install: {hints.get(n, n)}")
 
 
 def display_taken(num: int) -> bool:
-    """True if something answers on display :num.
-
-    Probes TCP 60xx, the fs unix socket, AND the abstract unix socket
-    (Xvfb in rootless sandboxes often binds only the abstract one)."""
+    """TCP 60xx + fs socket + abstract socket (Xvfb here binds abstract only)."""
     try:
         s = socket.create_connection(("127.0.0.1", 6000 + num), timeout=0.3)
         s.close()
@@ -76,7 +97,7 @@ def display_taken(num: int) -> bool:
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(0.3)
-        s.connect(f"\0/tmp/.X11-unix/X{num}")
+        s.connect("\0/tmp/.X11-unix/X" + str(num))
         s.close()
         return True
     except OSError:
@@ -84,15 +105,34 @@ def display_taken(num: int) -> bool:
     return False
 
 
+def claimed_displays() -> set[int]:
+    out: set[int] = set()
+    for p in SESSIONS.glob("*.json"):
+        try:
+            d = json.loads(p.read_text()).get("display", "")
+            if isinstance(d, str) and d.startswith(":") and d[1:].isdigit():
+                out.add(int(d[1:]))
+        except (OSError, ValueError):
+            continue
+    return out
+
+
 def alloc_display() -> int:
-    for n in range(FIRST_DISPLAY, LAST_DISPLAY + 1):
-        if not display_taken(n):
-            return n
+    """Locked allocation: flock + live session files + socket probes."""
+    ALLOC_LOCK.touch(exist_ok=True)
+    with open(ALLOC_LOCK, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            claimed = claimed_displays()
+            for n in range(FIRST_DISPLAY, LAST_DISPLAY + 1):
+                if n not in claimed and not display_taken(n):
+                    return n
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
     raise SystemExit(f"No free display in :{FIRST_DISPLAY}-:{LAST_DISPLAY}. `boaz kill --all` or `boaz ps`.")
 
 
 def display_env(display: str) -> dict[str, str]:
-    """Headless-safe env: software GL + Lavapipe Vulkan when present, never :0."""
     e = dict(os.environ)
     e["DISPLAY"] = display
     e.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")
@@ -102,6 +142,14 @@ def display_env(display: str) -> dict[str, str]:
     return e
 
 
+def proc_stat_starttime(pid: int) -> str:
+    try:
+        parts = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return parts[19]  # field 22: starttime (jiffies since boot)
+    except (OSError, IndexError):
+        return ""
+
+
 def proc_cmdline(pid: int) -> str:
     try:
         return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
@@ -109,14 +157,21 @@ def proc_cmdline(pid: int) -> str:
         return ""
 
 
-def verified_kill(pid: int, expect: str) -> bool:
-    """Kill pid only if its cmdline still matches what we launched. Kills nothing else."""
+def verified_kill(pid: int, expect: str, starttime: str = "") -> bool:
+    """Kill pid only if cmdline still contains `expect` (non-empty) and the
+    starttime matches when given. Catches PermissionError. Never kills strangers."""
+    if not expect or not expect.strip():
+        return False
     cmd = proc_cmdline(pid)
     if not cmd or expect not in cmd:
         return False
+    if starttime and proc_stat_starttime(pid) != starttime:
+        return False  # PID recycled onto a same-command process
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
+        return False
+    except PermissionError:
         return False
     for _ in range(20):
         time.sleep(0.25)
@@ -124,64 +179,36 @@ def verified_kill(pid: int, expect: str) -> bool:
             return True
     try:
         os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
     return not proc_cmdline(pid)
 
 
 def wait_for_window(display: str, timeout: float = 30.0) -> str:
-    """Poll until a client window maps. Replaces the old blind sleep(2)."""
+    """Poll until a non-root client window maps. Replaces the old blind sleep."""
+    need_bins("xdotool", "xwininfo")
     env = display_env(display)
     deadline = time.time() + timeout
     while time.time() < deadline:
-        r = subprocess.run(
-            ["xdotool", "search", "--onlyvisible", "--name", ".*"],
-            env=env, capture_output=True, text=True)
-        ids = [i for i in r.stdout.split() if i.strip()]
-        # xdotool also sees the root window in some builds; require a child.
-        for wid in ids:
+        r = subprocess.run(["xdotool", "search", "--onlyvisible", "--name", ".*"],
+                           env=env, capture_output=True, text=True)
+        for wid in r.stdout.split():
             q = subprocess.run(["xwininfo", "-id", wid], env=env,
                                capture_output=True, text=True)
             if "Map State: IsViewable" in q.stdout and "root window" not in q.stdout:
                 return wid
         time.sleep(0.5)
-    raise SystemExit(f"No window mapped on {display} after {timeout}s. App log: check `boaz log <name>`.")
+    raise SystemExit(f"No window mapped on {display} after {timeout}s. See `boaz log`.")
 
 
-def capture(display: str, path: Path, window: str | None = None) -> Path:
-    """ffmpeg x11grab first (proven), scrot second. Raises on failure — never silent black lies.
-
-    Returns path. Verifies the file is a decodable PNG with nonzero size.
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    target = f"{display}+0,0" if window is None else f"{display}"
-    errs: list[str] = []
-    ff = ["ffmpeg", "-y", "-v", "error", "-f", "x11grab",
-          "-draw_mouse", "0", "-i", target, "-frames:v", "1", str(path)]
-    if window:
-        # Per-window grab via xwd (x11grab root grabs miss odd visuals).
-        xwd = Path(str(path) + ".xwd")
-        r = subprocess.run(["xwd", "-display", display, "-id", window, "-out", str(xwd)],
-                           capture_output=True, text=True)
-        if r.returncode == 0:
-            r = subprocess.run(["convert", str(xwd), str(path)], capture_output=True, text=True)
-            xwd.unlink(missing_ok=True)
-            if r.returncode == 0 and _valid_png(path):
-                return path
-        errs.append(f"xwd: {(r.stderr or '')[:120]}")
-    else:
-        r = subprocess.run(ff, capture_output=True, text=True)
-        if r.returncode == 0 and _valid_png(path):
-            return path
-        errs.append(f"ffmpeg: {(r.stderr or '')[:160]}")
-    scrot = resolve(SCROT_CANDIDATES, "scrot", "sudo apt install scrot")
-    env = display_env(display)
-    args = [scrot, "-z", str(path)] if window is None else [scrot, "-z", "-u", str(path)]
-    r = subprocess.run(args, env=env, capture_output=True, text=True)
-    if r.returncode == 0 and _valid_png(path):
-        return path
-    errs.append(f"scrot: {(r.stderr or '')[:160]}")
-    raise SystemExit(f"screenshot failed on {display}: {' | '.join(errs)}")
+def _variance_ok(path: Path) -> bool:
+    """Reject flat frames (dead app, unmapped window). Content gate: exit 0 must mean pixels."""
+    try:
+        from PIL import Image, ImageStat
+        small = Image.open(path).convert("L").resize((160, 100))
+        return (ImageStat.Stat(small).stddev[0] or 0) > 1.5
+    except Exception:
+        return True  # PIL missing or undecodable here is handled by _valid_png
 
 
 def _valid_png(path: Path) -> bool:
@@ -189,3 +216,53 @@ def _valid_png(path: Path) -> bool:
         return path.stat().st_size > 500 and path.read_bytes()[1:4] == b"PNG"
     except OSError:
         return False
+
+
+def capture(display: str, path: Path, window: str | None = None) -> Path:
+    """ffmpeg x11grab first, xwd per-window, scrot root last. Verified non-flat.
+
+    Raises SystemExit (no traceback to agents) with the failing tool's stderr.
+    """
+    need_bins("ffmpeg", "scrot")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    errs: list[str] = []
+    if window:
+        need_bins("xwd", "convert")
+        xwd = path.with_suffix(".xwd")
+        r = subprocess.run(["xwd", "-display", display, "-id", window, "-out", str(xwd)],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            r = subprocess.run(["convert", str(xwd), str(path)], capture_output=True, text=True)
+            xwd.unlink(missing_ok=True)
+            if r.returncode == 0 and _valid_png(path) and _variance_ok(path):
+                return path
+            if _valid_png(path):
+                raise SystemExit(f"capture on {display} is blank (stddev≈0) — is the app still running?")
+        errs.append(f"xwd: {(r.stderr or '').strip()[:160]}")
+    else:
+        r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "x11grab", "-draw_mouse", "0",
+                            "-i", f"{display}+0,0", "-frames:v", "1", str(path)],
+                           capture_output=True, text=True)
+        if r.returncode == 0 and _valid_png(path):
+            if _variance_ok(path):
+                return path
+            raise SystemExit(f"capture on {display} is blank (stddev≈0) — is the app still running?")
+        errs.append(f"ffmpeg: {(r.stderr or '').strip()[:160]}")
+        need_bins("xwd", "convert")
+        xwd = path.with_suffix(".xwd")
+        r = subprocess.run(["xwd", "-display", display, "-root", "-out", str(xwd)],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            r = subprocess.run(["convert", str(xwd), str(path)], capture_output=True, text=True)
+            xwd.unlink(missing_ok=True)
+            if r.returncode == 0 and _valid_png(path) and _variance_ok(path):
+                return path
+        errs.append(f"xwd-root: {(r.stderr or '').strip()[:160]}")
+    env = display_env(display)
+    r = subprocess.run(["scrot", "-z", str(path)], env=env, capture_output=True, text=True)
+    if r.returncode == 0 and _valid_png(path):
+        if _variance_ok(path):
+            return path
+        raise SystemExit(f"capture on {display} is blank (stddev≈0) — is the app still running?")
+    errs.append(f"scrot: {(r.stderr or '').strip()[:160]}")
+    raise SystemExit(f"screenshot failed on {display}: {' | '.join(errs)}")

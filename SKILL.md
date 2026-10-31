@@ -57,6 +57,11 @@ Sessions are per-`--name` (own DISPLAY + state file). `kill` verifies
 kill a stranger. `kill --all --sweep` reaps orphans. Never `kill -9` by hand;
 never bind `:99` yourself.
 
+`kill` verifies cmdline AND starttime before signalling and keeps — never
+deletes — a session it refused to kill. `kill --all --sweep` reaps only
+boaz-marked Xvfb servers (`argv[0]=boaz-Xvfb`); a foreign plain `Xvfb` always
+survives. Blank captures exit non-zero with "display is blank".
+
 Internal rule for contributors: never call a typer command from another
 command — `typer.Option` defaults are truthy `OptionInfo` objects off-CLI
 (this once caused `launch` to `kill --all` every sibling session). Always go

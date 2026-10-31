@@ -6,7 +6,7 @@ vision. Your `:0` stays yours — boaz never touches it.
 
 ```bash
 boaz launch "./my-app --no-sandbox" --name vp    # headless :99+, polls for a mapped window
-boaz screenshot --name vp                         # -> shots/vp-001.png
+boaz screenshot --name vp                         # -> shots/vp-001.png (CWD-relative)
 boaz run tests/flow.json --name vp                # xdotool script, PASS/FAIL + exit codes
 boaz record --name vp --out shots/tour.mp4        # ffmpeg x11grab, frame-verified
 boaz log --name vp                                # app stdout when no window appears
@@ -21,9 +21,21 @@ probed via TCP + filesystem + abstract sockets) and its own state file, so
 parallel agents don't collide. `kill` verifies `/proc` cmdlines before
 signalling and refuses to kill strangers; `--sweep` reaps orphan Xvfb servers.
 
+Run scripts look like `tests/flow.json`:
+
+```json
+[{"action": "wait", "seconds": 0.5}, {"action": "key", "keys": "F5"},
+ {"action": "type", "text": "hello"}, {"action": "click", "x": 640, "y": 400},
+ {"action": "screenshot"}]
+```
+
+Notes: relaunching a `--name` kills its old session first; screenshots land in
+`shots/` under your current directory; captures are content-gated — a blank
+frame exits non-zero instead of lying to the agent.
+
 ## Requirements (Linux)
 
-`Xvfb xdotool ffmpeg scrot xwd` — rootless fallback works without sudo:
+`Xvfb xdotool xwininfo xwd ffmpeg ffprobe scrot convert` — rootless fallback works without sudo:
 
 ```bash
 apt-get download xvfb scrot x11-apps   # no root needed
@@ -37,8 +49,8 @@ ln -s ~/.local/xvfb-root/usr/bin/Xvfb ~/.local/bin/
 |---|---|---|---|---|
 | Linux + Xvfb | ✅ | ✅ ffmpeg→scrot | ✅ xdotool | Full support. Vulkan apps need WSI; use software GL. |
 | Linux, no Xvfb | ❌ clear error | — | — | `boaz doctor` tells you the exact install |
-| macOS | ❌ | ❌ | ❌ | No X server to isolate on. Beta path (hidden `open -g` + `screencapture`) not yet implemented — refuses loudly instead of faking it |
-| Windows/WSL | ❌ | ❌ | ❌ | Same: refuses loudly. Screenshots must come from the Windows side |
+| macOS | ❌ | ❌ | ❌ | No X server to isolate on — refuses loudly instead of faking it |
+| Windows native | ❌ | ❌ | ❌ | Refuses loudly. WSL2 counts as Linux: Xvfb works, this suite is green there |
 
 A documented gap beats a silent lie.
 

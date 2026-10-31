@@ -1,0 +1,1 @@
+[{"action": "wait", "seconds": 0.5}, {"action": "key", "keys": "F5"}, {"action": "screenshot"}]
