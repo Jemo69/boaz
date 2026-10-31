@@ -143,9 +143,22 @@ def test_crashed_app_kill_reaps_display(names):
     assert not display_taken(int(disp[1:])), "display must be free again"
 
 
+def _live_session(name, num, xvfb):
+    """Craft a session that passes need_session: real Xvfb pid/starttime/boot
+    plus a live app pid. Names stay neutral so message asserts can't pass
+    off the echoed session name."""
+    import os as _os
+    from desktop import proc_stat_starttime as _sst, boot_id as _boot
+    (sessions_dir() / f"{name}.json").write_text(json.dumps({
+        "display": f":{num}", "app": _os.getpid(),
+        "app_starttime": _sst(_os.getpid()), "xvfb": xvfb.pid,
+        "xvfb_starttime": _sst(xvfb.pid), "boot_id": _boot(),
+        "cmd": "test-fixture", "name": name}))
+
+
 @needs_linux
 def test_corrupt_session_fails_clean_and_clears(names):
-    n = tag("t-corrupt")
+    n = tag("t-badjson")
     p = sessions_dir() / f"{n}.json"
     p.write_text('{"cmd": "x"}')
     try:
@@ -178,23 +191,24 @@ def test_concurrent_launches_isolate(names):
 
 @needs_linux
 def test_blank_capture_refuses_exit_zero(names):
-    """boaz screenshot on an empty display: non-zero exit, no traceback, no file left."""
+    """boaz screenshot on an empty display: non-zero exit, no traceback, no file left.
+    Uses a VALID session (real Xvfb pid) so the refusal comes from the blank
+    gate itself, not from session validation."""
     from desktop import alloc_display, confirm_display
     num = alloc_display()
-    xvfb = subprocess.Popen([str(Path.home() / ".local" / "bin" / "Xvfb"),
-                               f":{num}", "-screen", "0", "800x600x24"],
+    xvfb = subprocess.Popen(["boaz-Xvfb", f":{num}", "-screen", "0", "800x600x24"],
+                              executable=str(Path.home() / ".local" / "bin" / "Xvfb"),
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(1.0)
-    n = tag("t-blank"); names.append(n)
+    n = tag("t-flat"); names.append(n)
     try:
         confirm_display(num)
-        (sessions_dir() / f"{n}.json").write_text(json.dumps(
-            {"display": f":{num}", "app": 1, "cmd": "gone", "name": n}))
-        r = boaz("screenshot", "--name", n, "--out", f"/tmp/boaz-{n}-blank.png")
+        _live_session(n, num, xvfb)
+        r = boaz("screenshot", "--name", n, "--out", f"/tmp/boaz-{n}-flat.png")
         assert r.returncode != 0, "blank capture exited 0: " + r.stdout
         assert "Traceback" not in r.stdout + r.stderr
         assert "blank" in (r.stdout + r.stderr).lower()
-        assert not Path(f"/tmp/boaz-{n}-blank.png").exists(), "blank frame must not be left behind"
+        assert not Path(f"/tmp/boaz-{n}-flat.png").exists(), "blank frame must not be left behind"
     finally:
         (sessions_dir() / f"{n}.json").unlink(missing_ok=True)
         xvfb.terminate(); xvfb.wait()
@@ -283,16 +297,15 @@ def test_record_blank_dead_app_refuses_and_cleans(names):
     """Static record of a dead app: non-zero exit AND no MP4 left behind."""
     from desktop import alloc_display, confirm_display
     num = alloc_display()
-    xvfb = subprocess.Popen([str(Path.home() / ".local" / "bin" / "Xvfb"),
-                               f":{num}", "-screen", "0", "800x600x24"],
+    xvfb = subprocess.Popen(["boaz-Xvfb", f":{num}", "-screen", "0", "800x600x24"],
+                              executable=str(Path.home() / ".local" / "bin" / "Xvfb"),
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(1.0)
-    n = tag("t-rblank")
+    n = tag("t-nofeed"); names.append(n)
     out = f"/tmp/boaz-{n}.mp4"
     try:
         confirm_display(num)
-        (sessions_dir() / f"{n}.json").write_text(json.dumps(
-            {"display": f":{num}", "app": 1, "cmd": "gone", "name": n}))
+        _live_session(n, num, xvfb)
         r = boaz("record", "--name", n, "--out", out, "--seconds", "1")
         assert r.returncode != 0, f"black MP4 accepted:\n{r.stdout}"
         assert "blank" in (r.stdout + r.stderr).lower()
@@ -428,7 +441,7 @@ def test_stale_session_refuses_to_drive_foreign_display(names):
                                f":{num}", "-screen", "0", "800x600x24"],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(1.0)
-    n = tag("t-stale"); names.append(n)
+    n = tag("t-gone"); names.append(n)
     try:
         confirm_display(num)
         (sessions_dir() / f"{n}.json").write_text(json.dumps(
