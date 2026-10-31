@@ -23,7 +23,7 @@ from desktop import (
     FIRST_DISPLAY, HEIGHT, LAST_DISPLAY, WIDTH, XVFB_ARGV0,
     alloc_display, capture, confirm_display, display_env, display_taken, drop_session, load,
     need_session, proc_cmdline, proc_environ, proc_stat_starttime, release_display, safe_stem, save, session_path, sessions_dir, verified_kill,
-    wait_for_window, need_bins, xvfb_bin,
+    wait_for_window, need_bins, xvfb_bin, GLOBAL_RESERVE,
 )
 
 sys.stdout.reconfigure(line_buffering=True)
@@ -311,9 +311,12 @@ def record(
             except OSError:
                 pass
             raise SystemExit(f"record aborted: script {script} FAILED, no MP4 verified")
-    frames = subprocess.run(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
+    try:
+        frames = subprocess.run(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
                              "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", tmp_out],
                             capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        frames = subprocess.CompletedProcess([], 124, "", "ffprobe timed out")
     n = frames.stdout.strip()
     def _fail(msg: str) -> None:
         # Only tmp_out is ever disowned: out may be the user's pre-existing file.
@@ -326,9 +329,12 @@ def record(
     if not n or n == "0":
         _fail("record produced no frames")
     # Content gate: pull one frame, refuse flat/black recordings.
-    fr = subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", tmp_out,
-                           "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"],
-                          capture_output=True)
+    try:
+        fr = subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", tmp_out,
+                               "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"],
+                              capture_output=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        fr = subprocess.CompletedProcess([], 124, b"", "frame extract timed out")
     try:
         from PIL import Image, ImageStat
         import io as _io
@@ -467,6 +473,12 @@ def _kill(names: list[str], sweep: bool, force: bool, quiet: bool) -> list[str]:
                 leftovers.append(f"unverified app pid={app_pid}")
                 if not quiet:
                     rprint(f"[dim]{n}:app alive but identity unverified (PID reuse?) — session kept. Use --force to drop.[/]")
+        elif app_pid:
+            # Leader already dead (crashed/exited): reap surviving group members.
+            from desktop import kill_group as _kg, pids_in_group as _pig
+            if _pig(app_pid):
+                for survivor in _kg(app_pid):
+                    leftovers.append(f"orphaned group member pid={survivor}")
         if xvfb_pid and proc_cmdline(xvfb_pid):
             if verified_kill(xvfb_pid, XVFB_ARGV0, st.get("xvfb_starttime", "")):
                 pass
@@ -480,6 +492,14 @@ def _kill(names: list[str], sweep: bool, force: bool, quiet: bool) -> list[str]:
         drop_session(n)
     if sweep:
         # Reclaim dead X-lock files too (stale SIGKILL residue with no live pid).
+        # Reap stale GLOBAL reservations (same 60s gate as the allocator).
+        now = time.time()
+        for r in GLOBAL_RESERVE.glob("*"):
+            try:
+                if now - r.stat().st_mtime > 60:
+                    r.unlink()
+            except OSError:
+                pass
         for lk in Path("/tmp").glob(".X*-lock"):
             try:
                 pid_txt = lk.read_text().strip().split()[0]
@@ -488,14 +508,7 @@ def _kill(names: list[str], sweep: bool, force: bool, quiet: bool) -> list[str]:
                     lk.unlink()
             except (OSError, IndexError, ValueError):
                 pass
-        # Reclaim only STALE reservations (60s+): a concurrent launch may hold a fresh one.
-        now = time.time()
-        for r in sessions_dir().glob(".reserve-*"):
-            try:
-                if now - r.stat().st_mtime > 60:
-                    r.unlink()
-            except OSError:
-                pass
+        # (Global reservations were pruned above alongside dead X-locks.)
         claimed: set[int] = set()
         for q in sessions_dir().glob("*.json"):
             try:

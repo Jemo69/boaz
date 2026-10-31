@@ -41,9 +41,6 @@ def sessions_dir() -> Path:
     return d
 
 
-def alloc_lock() -> Path:
-    return sessions_dir().parent / ".alloc.lock"
-
 FIRST_DISPLAY = 99
 LAST_DISPLAY = 110
 WIDTH, HEIGHT = 1280, 800
@@ -162,9 +159,9 @@ def display_taken(num: int) -> bool:
     except (OSError, IndexError, ValueError):
         return True  # unreadable lock: conservative, treat as taken
     else:
-        if not Path(f"/proc/{lock_pid}").exists():
-            return False  # stale lock from a SIGKILLed server; Xvfb itself ignores it
-        return True
+        if Path(f"/proc/{lock_pid}").exists():
+            return True  # live owner: taken
+        # Stale lock: do NOT return False — fall through to the socket probes.
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(0.3)

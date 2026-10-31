@@ -305,11 +305,11 @@ def test_record_blank_dead_app_refuses_and_cleans(names):
 @needs_linux
 def test_bad_geometry_fails_fast_and_releases(names):
     n = tag("t-geo"); names.append(n)
-    from desktop import claimed_displays, sessions_dir
-    before = set(sessions_dir().glob(".reserve-*"))
+    from desktop import GLOBAL_RESERVE
+    before = set(GLOBAL_RESERVE.glob("*")) if GLOBAL_RESERVE.exists() else set()
     r = boaz("launch", "sleep 30", "--name", n, "--width", "0", "--wait", "5")
     assert r.returncode != 0 and "320" in (r.stdout + r.stderr)
-    leaked = set(sessions_dir().glob(".reserve-*")) - before
+    leaked = set(GLOBAL_RESERVE.glob("*")) - before if GLOBAL_RESERVE.exists() else set()
     assert not leaked, f"reservation leaked: {[p.name for p in leaked]}"
 
 
@@ -387,3 +387,36 @@ def test_sweep_spares_other_pool(names):
         assert Path(f"/proc/{xpid}").exists(), "other pool's Xvfb was swept"
     finally:
         shutil.rmtree(pool_b, ignore_errors=True)
+
+
+@needs_linux
+def test_kill_group_reaps_orphans():
+    """Deterministic: leader dies, group child survives, kill_group reaps it."""
+    import os as _os, signal as _sig, time as _t
+    from desktop import pids_in_group, kill_group
+    p = __import__('subprocess').Popen(['sh', '-c', 'sleep 60 & wait'], start_new_session=True)
+    try:
+        _t.sleep(0.5)
+        _os.kill(p.pid, _sig.SIGKILL)
+        _t.sleep(0.5)
+        assert pids_in_group(p.pid), 'expected surviving group members'
+        assert kill_group(p.pid) == []
+        assert pids_in_group(p.pid) == []
+    finally:
+        p.wait()
+
+@needs_linux
+def test_stale_lock_does_not_hide_live_display(names):
+    """A stale X-lock plus a live abstract socket must read as taken."""
+    import socket as _sock
+    from desktop import display_taken, alloc_display
+    num = alloc_display()
+    from desktop import release_display
+    srv = _sock.socket(_sock.AF_UNIX, _sock.SOCK_STREAM)
+    try:
+        srv.bind("\0/tmp/.X11-unix/X%d" % num)
+        srv.listen(1)
+        assert display_taken(num) is True, "live abstract socket ignored"
+    finally:
+        srv.close()
+        release_display(num)
