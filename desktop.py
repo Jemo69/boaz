@@ -114,6 +114,8 @@ def display_taken(num: int) -> bool:
         pass
     if Path(f"/tmp/.X11-unix/X{num}").exists():
         return True
+    if Path(f"/tmp/.X{num}-lock").exists():
+        return True
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(0.3)
@@ -316,7 +318,7 @@ def capture(display: str, path: Path, window: str | None = None) -> Path:
                         return hit
                     raise blank()
                 raise SystemExit(f"screenshot failed on {display}: xwd produced no PNG")
-        errs.append(f"xwd: {(r.stderr or '').strip()[:160]}")
+        raise SystemExit(f"window capture failed on {display}: {(r.stderr or '').strip()[:160]}")
     else:
         r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "x11grab", "-draw_mouse", "0",
                             "-i", f"{display}+0,0", "-frames:v", "1", str(tmp)],

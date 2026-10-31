@@ -154,6 +154,7 @@ def run(
 
 def _run(script: str, name: str) -> bool:
     _require_linux("run")
+    need_bins("xdotool")
     st = need_session(name)
     try:
         steps = json.loads(Path(script).read_text())

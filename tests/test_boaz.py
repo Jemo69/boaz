@@ -214,9 +214,11 @@ def test_verified_kill_never_kills_strangers():
 @needs_linux
 def test_sweep_spares_foreign_xvfb():
     """A plain Xvfb (no boaz marker) must survive kill --all --sweep."""
+    from desktop import alloc_display
     if not Path(SYS_XVFB).exists():
         pytest.skip("Xvfb shim missing")
-    foreign = subprocess.Popen([SYS_XVFB, ":104", "-screen", "0", "800x600x24"],
+    num = alloc_display()  # never hardcode :104 — the pool is shared
+    foreign = subprocess.Popen([SYS_XVFB, f":{num}", "-screen", "0", "800x600x24"],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(1.0)
     try:
