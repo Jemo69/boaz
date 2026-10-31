@@ -1,0 +1,21 @@
+[project]
+name = "boaz"
+version = "0.2.0"
+description = "Boaz — headless desktop tester for AI agents. Agent sees the app, you don't (until ready)."
+requires-python = ">=3.10"
+dependencies = [
+    "typer",
+    "rich",
+    "pillow>=12.3.0",
+    "pytest>=9.2.0",
+]
+dev-dependencies = ["pytest"]
+
+[project.scripts]
+boaz = "main:app"
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

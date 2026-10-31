@@ -1,0 +1,55 @@
+# Boaz — headless desktop tester
+
+Mishpat owns the browser; **boaz owns the desktop.** Launch Electron/GPUI/Qt/any
+X11 app on an invisible DISPLAY, drive it like an agent, read screenshots with
+vision. Your `:0` stays yours — boaz never touches it.
+
+```bash
+boaz launch "./my-app --no-sandbox" --name vp    # headless :99+, polls for a mapped window
+boaz screenshot --name vp                         # -> shots/vp-001.png
+boaz run tests/flow.json --name vp                # xdotool script, PASS/FAIL + exit codes
+boaz record --name vp --out shots/tour.mp4        # ffmpeg x11grab, frame-verified
+boaz log --name vp                                # app stdout when no window appears
+boaz show --name vp                               # relaunch VISIBLE — only when READY_FOR_HUMAN
+boaz kill --name vp        # verified PIDs only; --all / --sweep for orphans
+boaz ps                    # live sessions
+boaz doctor                # readiness check for this machine
+```
+
+Sessions are isolated: each `--name` gets its own DISPLAY (`:99`–`:110`,
+probed via TCP + filesystem + abstract sockets) and its own state file, so
+parallel agents don't collide. `kill` verifies `/proc` cmdlines before
+signalling and refuses to kill strangers; `--sweep` reaps orphan Xvfb servers.
+
+## Requirements (Linux)
+
+`Xvfb xdotool ffmpeg scrot xwd` — rootless fallback works without sudo:
+
+```bash
+apt-get download xvfb scrot x11-apps   # no root needed
+dpkg -x xvfb_*.deb ~/.local/xvfb-root
+ln -s ~/.local/xvfb-root/usr/bin/Xvfb ~/.local/bin/
+```
+
+## Capability table (honest)
+
+| Platform | launch | screenshot | run/record | Notes |
+|---|---|---|---|---|
+| Linux + Xvfb | ✅ | ✅ ffmpeg→scrot | ✅ xdotool | Full support. Vulkan apps need WSI; use software GL. |
+| Linux, no Xvfb | ❌ clear error | — | — | `boaz doctor` tells you the exact install |
+| macOS | ❌ | ❌ | ❌ | No X server to isolate on. Beta path (hidden `open -g` + `screencapture`) not yet implemented — refuses loudly instead of faking it |
+| Windows/WSL | ❌ | ❌ | ❌ | Same: refuses loudly. Screenshots must come from the Windows side |
+
+A documented gap beats a silent lie.
+
+## Why not just run it visibly?
+
+Because your mouse and the agent's script share one screen. Boaz puts the app on a
+display you cannot see or click, so a stray keystroke can never trash a test run.
+The agent reads every step as PNG; you look only at the final MP4 or `boaz show`.
+
+## Tests
+
+```bash
+uv run pytest tests/ -q   # 5 live-session tests: cycle, run PASS/FAIL, record frames, isolation, kill-safety
+```
