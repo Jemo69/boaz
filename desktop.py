@@ -168,11 +168,15 @@ def alloc_display() -> int:
         finally:
             if fcntl is not None:
                 fcntl.flock(lock, fcntl.LOCK_UN)
-    raise SystemExit(f"No free display in :{FIRST_DISPLAY}-:{LAST_DISPLAY}. `boaz kill --all` or `boaz ps`.")
+    raise SystemExit(f"No free display in :{FIRST_DISPLAY}-:{LAST_DISPLAY}. `boaz kill --all`, `boaz ps`, or `boaz kill --name X --force` for stale sessions.")
 
 
 def confirm_display(num: int) -> None:
     """Reservation fulfilled: the server answers, release the hold."""
+    release_display(num)
+
+
+def release_display(num: int) -> None:
     try:
         Path(SESSIONS / f".reserve-{num}").unlink()
     except FileNotFoundError:
@@ -187,6 +191,13 @@ def display_env(display: str) -> dict[str, str]:
     if Path(lvp).exists():
         e.setdefault("VK_ICD_FILENAMES", lvp)
     return e
+
+
+def boot_id() -> str:
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return "unknown"
 
 
 def proc_stat_starttime(pid: int) -> str:
@@ -273,7 +284,10 @@ def capture(display: str, path: Path, window: str | None = None) -> Path:
     Raises SystemExit (no traceback to agents) with the failing tool's stderr.
     """
     need_bins("ffmpeg")
-    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise SystemExit(f"cannot write {path}: {e}")
     tmp = path.with_name(path.name + ".tmp.png")
     xwd = path.with_name(path.name + ".tmp.xwd")
     errs: list[str] = []

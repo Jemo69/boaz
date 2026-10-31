@@ -225,3 +225,61 @@ def test_sweep_spares_foreign_xvfb():
         assert foreign.poll() is None, "FOREIGN Xvfb was killed by sweep"
     finally:
         foreign.terminate(); foreign.wait()
+
+
+@needs_linux
+def test_type_corrupt_session_clears_clean(names):
+    n = tag("t-type")
+    p = Path.home() / f".cache/boaz/sessions/{n}.json"
+    p.write_text(json.dumps({"display": ":99", "app": "notanint", "xvfb": "alsonotint", "cmd": "x"}))
+    try:
+        r = boaz("kill", "--name", n)
+        assert r.returncode == 0 and "Traceback" not in r.stdout + r.stderr, r.stdout + r.stderr
+        assert not p.exists(), "wrong-typed session must be cleared"
+        r = boaz("ps")
+        assert r.returncode == 0 and "Traceback" not in r.stdout + r.stderr
+    finally:
+        p.unlink(missing_ok=True)
+
+
+@needs_linux
+@needs_xlogo
+def test_unwritable_out_no_traceback(names):
+    n = tag("t-wro"); names.append(n)
+    boaz("launch", str(XLOGO), "--name", n, "--wait", "15")
+    r = boaz("screenshot", "--name", n, "--out", "/root/nope/x.png")
+    assert r.returncode != 0 and "Traceback" not in r.stdout + r.stderr
+    assert "cannot write" in (r.stdout + r.stderr).lower()
+
+
+@needs_linux
+def test_record_blank_dead_app_refuses_and_cleans(names):
+    """Static record of a dead app: non-zero exit AND no MP4 left behind."""
+    from desktop import alloc_display, confirm_display
+    num = alloc_display()
+    xvfb = subprocess.Popen([str(Path.home() / ".local" / "bin" / "Xvfb"),
+                               f":{num}", "-screen", "0", "800x600x24"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(1.0)
+    n = tag("t-rblank")
+    out = f"/tmp/boaz-{n}.mp4"
+    try:
+        confirm_display(num)
+        Path.home().joinpath(f".cache/boaz/sessions/{n}.json").write_text(json.dumps(
+            {"display": f":{num}", "app": 1, "cmd": "gone", "name": n}))
+        r = boaz("record", "--name", n, "--out", out, "--seconds", "1")
+        assert r.returncode != 0, f"black MP4 accepted:\n{r.stdout}"
+        assert "blank" in (r.stdout + r.stderr).lower()
+        assert not Path(out).exists(), "unverified MP4 must be removed"
+    finally:
+        Path.home().joinpath(f".cache/boaz/sessions/{n}.json").unlink(missing_ok=True)
+        xvfb.terminate(); xvfb.wait()
+
+
+@needs_linux
+def test_bad_geometry_fails_fast_and_releases(names):
+    n = tag("t-geo"); names.append(n)
+    r = boaz("launch", "sleep 30", "--name", n, "--width", "0", "--wait", "5")
+    assert r.returncode != 0 and "320" in (r.stdout + r.stderr)
+    from desktop import claimed_displays
+    assert not [d for d in claimed_displays()], f"reservation leaked: {claimed_displays()}"

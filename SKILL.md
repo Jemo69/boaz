@@ -60,7 +60,7 @@ never bind `:99` yourself.
 `kill` verifies cmdline AND starttime before signalling and keeps — never
 deletes — a session it refused to kill. `kill --all --sweep` reaps only
 boaz-marked Xvfb servers (`argv[0]=boaz-Xvfb`); a foreign plain `Xvfb` always
-survives. Blank captures exit non-zero with "display is blank".
+survives. Blank captures AND blank recordings exit non-zero with "blank" and leave no file behind (tmp + os.replace).
 
 Internal rule for contributors: never call a typer command from another
 command — `typer.Option` defaults are truthy `OptionInfo` objects off-CLI
