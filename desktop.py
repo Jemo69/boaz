@@ -23,6 +23,10 @@ import subprocess
 import time
 from pathlib import Path
 
+GLOBAL_RESERVE = Path('/tmp/.boaz-reserve')
+GLOBAL_LOCK = Path('/tmp/.boaz-alloc.lock')
+
+
 def sessions_dir() -> Path:
     """Per-invocation override so parallel agents/CI never share a pool."""
     d = Path(os.environ.get("BOAZ_SESSION_DIR", str(Path.home() / ".cache" / "boaz" / "sessions")))
@@ -160,9 +164,20 @@ def display_taken(num: int) -> bool:
     return False
 
 
+def _cap_run(args, **kw):
+    """Capture-tool runner with a hard timeout. A hung grabber must never hang
+    the agent: timeouts come back as failures and the chain falls through."""
+    kw.setdefault('timeout', 15)
+    try:
+        return subprocess.run(args, **kw)
+    except subprocess.TimeoutExpired as e:
+        return subprocess.CompletedProcess(args, 124, '', f'timed out after {e.timeout}s')
+
+
 def _prune_reservations() -> None:
+    GLOBAL_RESERVE.mkdir(parents=True, exist_ok=True)
     now = time.time()
-    for r in sessions_dir().glob(".reserve-*"):
+    for r in list(GLOBAL_RESERVE.glob("*")) + list(sessions_dir().glob(".reserve-*")):
         try:
             if now - r.stat().st_mtime > 60:
                 r.unlink()
@@ -173,14 +188,17 @@ def _prune_reservations() -> None:
 def claimed_displays() -> set[int]:
     _prune_reservations()
     out: set[int] = set()
-    for r in sessions_dir().glob(".reserve-*"):
+    for r in GLOBAL_RESERVE.glob("*"):
         try:
-            out.add(int(r.name.split("-")[1]))
+            out.add(int(r.name))
         except (IndexError, ValueError):
             pass
     for p in sessions_dir().glob("*.json"):
         try:
-            d = json.loads(p.read_text()).get("display", "")
+            data = json.loads(p.read_text())
+            if not isinstance(data, dict):
+                continue
+            d = data.get("display", "")
             if isinstance(d, str) and d.startswith(":") and d[1:].isdigit():
                 out.add(int(d[1:]))
         except (OSError, ValueError):
@@ -189,17 +207,19 @@ def claimed_displays() -> set[int]:
 
 
 def alloc_display() -> int:
-    """Locked allocation: flock + live session files + socket probes."""
-    lock_path = alloc_lock()
-    lock_path.touch(exist_ok=True)
-    with open(lock_path, "w") as lock:
+    """Locked allocation: global flock + global reservations + socket probes.
+    The lock and reservations live in /tmp (shared by all pools) so two
+    agents in different BOAZ_SESSION_DIRs can never take the same display."""
+    GLOBAL_LOCK.touch(exist_ok=True)
+    with open(GLOBAL_LOCK, "w") as lock:
         if fcntl is not None:
             fcntl.flock(lock, fcntl.LOCK_EX)
         try:
             claimed = claimed_displays()
             for n in range(FIRST_DISPLAY, LAST_DISPLAY + 1):
                 if n not in claimed and not display_taken(n):
-                    Path(sessions_dir() / f".reserve-{n}").touch()
+                    GLOBAL_RESERVE.mkdir(parents=True, exist_ok=True)
+                    Path(GLOBAL_RESERVE / str(n)).touch()
                     return n
         finally:
             if fcntl is not None:
@@ -213,10 +233,11 @@ def confirm_display(num: int) -> None:
 
 
 def release_display(num: int) -> None:
-    try:
-        Path(sessions_dir() / f".reserve-{num}").unlink()
-    except FileNotFoundError:
-        pass
+    for r in (GLOBAL_RESERVE / str(num), sessions_dir() / f".reserve-{num}"):
+        try:
+            r.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def display_env(display: str) -> dict[str, str]:
@@ -329,10 +350,10 @@ def wait_for_window(display: str, timeout: float = 30.0) -> str:
     env = display_env(display)
     deadline = time.time() + timeout
     while time.time() < deadline:
-        r = subprocess.run(["xdotool", "search", "--onlyvisible", "--name", ".*"],
+        r = _cap_run(["xdotool", "search", "--onlyvisible", "--name", ".*"],
                            env=env, capture_output=True, text=True)
         for wid in r.stdout.split():
-            q = subprocess.run(["xwininfo", "-id", wid], env=env,
+            q = _cap_run(["xwininfo", "-id", wid], env=env,
                                capture_output=True, text=True)
             if "Map State: IsViewable" in q.stdout and "root window" not in q.stdout:
                 return wid
@@ -385,10 +406,10 @@ def capture(display: str, path: Path, window: str | None = None) -> Path:
 
     if window:
         need_bins("xwd", "convert")
-        r = subprocess.run(["xwd", "-display", display, "-id", window, "-out", str(xwd)],
+        r = _cap_run(["xwd", "-display", display, "-id", window, "-out", str(xwd)],
                            capture_output=True, text=True)
         if r.returncode == 0:
-            r = subprocess.run(["convert", str(xwd), str(tmp)], capture_output=True, text=True)
+            r = _cap_run(["convert", str(xwd), str(tmp)], capture_output=True, text=True)
             xwd.unlink(missing_ok=True)
             if r.returncode == 0:
                 if _valid_png(tmp):
@@ -399,7 +420,7 @@ def capture(display: str, path: Path, window: str | None = None) -> Path:
                 raise SystemExit(f"screenshot failed on {display}: xwd produced no PNG")
         raise SystemExit(f"window capture failed on {display}: {(r.stderr or '').strip()[:160]}")
     else:
-        r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "x11grab", "-draw_mouse", "0",
+        r = _cap_run(["ffmpeg", "-y", "-v", "error", "-f", "x11grab", "-draw_mouse", "0",
                             "-i", f"{display}+0,0", "-frames:v", "1", str(tmp)],
                            capture_output=True, text=True)
         if r.returncode == 0 and _valid_png(tmp):
@@ -409,10 +430,10 @@ def capture(display: str, path: Path, window: str | None = None) -> Path:
             raise blank()
         errs.append(f"ffmpeg: {(r.stderr or '').strip()[:160]}")
         need_bins("xwd", "convert")
-        r = subprocess.run(["xwd", "-display", display, "-root", "-out", str(xwd)],
+        r = _cap_run(["xwd", "-display", display, "-root", "-out", str(xwd)],
                            capture_output=True, text=True)
         if r.returncode == 0:
-            r = subprocess.run(["convert", str(xwd), str(tmp)], capture_output=True, text=True)
+            r = _cap_run(["convert", str(xwd), str(tmp)], capture_output=True, text=True)
             xwd.unlink(missing_ok=True)
             if r.returncode == 0 and _valid_png(tmp):
                 hit = done()
@@ -422,7 +443,7 @@ def capture(display: str, path: Path, window: str | None = None) -> Path:
         errs.append(f"xwd-root: {(r.stderr or '').strip()[:160]}")
     env = display_env(display)
     need_bins("scrot")
-    r = subprocess.run(["scrot", "-z", str(tmp)], env=env, capture_output=True, text=True)
+    r = _cap_run(["scrot", "-z", str(tmp)], env=env, capture_output=True, text=True)
     if r.returncode == 0 and _valid_png(tmp):
         hit = done()
         if hit:

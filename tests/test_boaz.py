@@ -200,6 +200,20 @@ def test_blank_capture_refuses_exit_zero(names):
         xvfb.terminate(); xvfb.wait()
 
 
+def test_shot_numbering_never_reuses():
+    from main import _next_shot
+    n = "t-num-" + uuid.uuid4().hex[:6]
+    a = _next_shot(n); a.write_text("x")
+    b = _next_shot(n); b.write_text("x")
+    (a.parent / f"{n}-010.png").write_text("x")
+    b.unlink()
+    nxt = _next_shot(n)
+    assert nxt.name == f"{n}-011.png", f"reused a deleted index: {nxt.name}"
+    for f in (a,):
+        f.unlink(missing_ok=True)
+    (a.parent / f"{n}-010.png").unlink(missing_ok=True)
+
+
 def test_verified_kill_never_kills_strangers():
     from desktop import verified_kill
     p = subprocess.Popen(["sleep", "60"])
@@ -229,6 +243,8 @@ def test_sweep_spares_foreign_xvfb():
         assert r.returncode == 0
         assert foreign.poll() is None, "FOREIGN Xvfb was killed by sweep"
     finally:
+        from desktop import release_display
+        release_display(num)
         foreign.terminate(); foreign.wait()
 
 

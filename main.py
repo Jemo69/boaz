@@ -49,12 +49,19 @@ def _require_linux(cmd: str) -> None:
             "boaz refuses loudly instead of faking it.")
 
 
+def _next_shot(path_stem: str, suffix: str = "") -> Path:
+    """Next free shot path by max numeric suffix, never reusing a deleted index."""
+    import re as _re
+    nums = [int(m.group(1)) for f in _shots_dir().glob(f"{path_stem}{suffix}-*.png")
+            if (m := _re.search(r"-(\d+)\.png$", f.name))]
+    return _shots_dir() / f"{path_stem}{suffix}-{max(nums, default=0) + 1:03d}.png"
+
+
 def _shot(name: str, out: str | None = None) -> str:
     st = need_session(name)
     stem = safe_stem(name)
     if out is None:
-        n = len(list(_shots_dir().glob(f"{stem}-*.png")))
-        out = str(_shots_dir() / f"{stem}-{n + 1:03d}.png")
+        out = str(_next_shot(stem))
     return str(capture(st["display"], Path(out)))
 
 
@@ -78,10 +85,11 @@ def launch(
     num = alloc_display()
     display = f":{num}"
     xvfb_path = xvfb_bin()
+    xvfb_env = dict(display_env(display), BOAZ_POOL=str(sessions_dir()))
     try:
         xvfb = subprocess.Popen(
             [XVFB_ARGV0, display, "-screen", "0", f"{width}x{height}x24"],
-            executable=xvfb_path,
+            executable=xvfb_path, env=xvfb_env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         # Wait for the server to actually answer before confirming + spawning.
         deadline = time.time() + 5.0
@@ -152,7 +160,7 @@ def screenshot(
     wid = None
     stem = safe_stem(name)
     if window:
-        r = subprocess.run(["xdotool", "search", "--onlyvisible", "--name", ".*"],
+        r = subprocess.run(["xdotool", "search", "--onlyvisible", "--name", ".*"], timeout=10,
                            env=display_env(st["display"]), capture_output=True, text=True)
         ids = r.stdout.split()
         wid = ids[0] if ids else None
@@ -160,7 +168,7 @@ def screenshot(
         raise SystemExit(f"No mapped window on {st['display']} yet.")
     rprint(_shot(name, out) if wid is None
            else str(capture(st["display"], Path(out) if out else
-                            _shots_dir() / f"{stem}-win-{len(list(_shots_dir().glob(f'{stem}-win-*.png'))):03d}.png", wid)))
+                            _next_shot(stem, "-win"), wid)))
 
 
 @app.command()
@@ -195,18 +203,18 @@ def _run(script: str, name: str) -> bool:
             elif a == "key":
                 if not isinstance(s.get("keys"), str):
                     raise ValueError("key needs a string 'keys'")
-                subprocess.run(["xdotool", "key", s["keys"]], env=env, check=True)
+                subprocess.run(["xdotool", "key", s["keys"]], env=env, check=True, timeout=10)
             elif a == "type":
                 if not isinstance(s.get("text"), str):
                     raise ValueError("type needs a string 'text'")
-                subprocess.run(["xdotool", "type", s["text"]], env=env, check=True)
+                subprocess.run(["xdotool", "type", s["text"]], env=env, check=True, timeout=10)
             elif a == "click":
                 try:
                     cx, cy = int(s["x"]), int(s["y"])
                 except (TypeError, ValueError):
                     raise ValueError(f"click needs integer x/y, got {s.get('x')!r},{s.get('y')!r}")
                 subprocess.run(["xdotool", "mousemove", str(cx), str(cy), "click", "1"],
-                               env=env, check=True)
+                               env=env, check=True, timeout=10)
             elif a == "screenshot":
                 pass  # every step screenshots anyway
             else:
@@ -220,7 +228,12 @@ def _run(script: str, name: str) -> bool:
             rprint(f"[bold red]  [{i}] {a} FAIL: xdotool exit {e.returncode}[/]")
             ok = False
             break
-        _shot(name)
+        try:
+            _shot(name)
+        except SystemExit as e:
+            rprint(f"[bold red]  [{i}] {a} FAIL: capture: {e}[/]")
+            ok = False
+            break
     rprint("[bold green]PASS[/]" if ok else "[bold red]FAIL[/]")
     return ok
 
@@ -269,7 +282,11 @@ def record(
                 rprint(f"[dim]static capture {seconds}s[/]")
         finally:
             ff.terminate()
-            ff.wait()
+            try:
+                ff.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                ff.kill()
+                ff.wait()
         if script and not script_ok:
             try:
                 Path(tmp_out).unlink()
@@ -278,7 +295,7 @@ def record(
             raise SystemExit(f"record aborted: script {script} FAILED, no MP4 verified")
     frames = subprocess.run(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
                              "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", tmp_out],
-                            capture_output=True, text=True)
+                            capture_output=True, text=True, timeout=30)
     n = frames.stdout.strip()
     def _fail(msg: str) -> None:
         # Only tmp_out is ever disowned: out may be the user's pre-existing file.
@@ -461,6 +478,8 @@ def _kill(names: list[str], sweep: bool, force: bool, quiet: bool) -> list[str]:
         for q in sessions_dir().glob("*.json"):
             try:
                 st0 = json.loads(q.read_text())
+                if not isinstance(st0, dict):
+                    continue
                 a, x = _coerce_pids(st0)
                 if a:
                     claimed.add(a)
@@ -473,8 +492,9 @@ def _kill(names: list[str], sweep: bool, force: bool, quiet: bool) -> list[str]:
                 continue
             # Cross-pool safety: only reap servers from THIS pool. Another
             # agent's boaz (different BOAZ_SESSION_DIR) is never our orphan.
-            owner = proc_environ(pid).get("BOAZ_SESSION_DIR", "")
-            if owner and owner.rstrip("/") != str(sessions_dir()).rstrip("/"):
+            penv = proc_environ(pid)
+            owner = penv.get("BOAZ_POOL", "") or penv.get("BOAZ_SESSION_DIR", "")
+            if not owner or owner.rstrip("/") != str(sessions_dir()).rstrip("/"):
                 continue
             st_match = proc_stat_starttime(pid)
             if verified_kill(pid, XVFB_ARGV0, st_match) and not quiet:
