@@ -448,9 +448,12 @@ def _kill(names: list[str], sweep: bool, force: bool, quiet: bool) -> list[str]:
                     lk.unlink()
             except (OSError, IndexError, ValueError):
                 pass
+        # Reclaim only STALE reservations (60s+): a concurrent launch may hold a fresh one.
+        now = time.time()
         for r in sessions_dir().glob(".reserve-*"):
             try:
-                r.unlink()
+                if now - r.stat().st_mtime > 60:
+                    r.unlink()
             except OSError:
                 pass
         claimed: set[int] = set()
