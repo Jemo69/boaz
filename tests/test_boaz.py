@@ -218,6 +218,11 @@ def test_verified_kill_never_kills_strangers():
     from desktop import verified_kill
     p = subprocess.Popen(["sleep", "60"])
     try:
+        from desktop import proc_cmdline as _pc
+        for _ in range(100):
+            if "sleep" in _pc(p.pid):
+                break
+            time.sleep(0.1)
         assert verified_kill(p.pid, "definitely-not-this-cmdline") is False
         assert verified_kill(p.pid, "   ") is False, "whitespace expect must not match"
         assert verified_kill(p.pid, "") is False, "empty expect must never kill"

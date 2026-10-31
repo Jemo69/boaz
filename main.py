@@ -160,6 +160,7 @@ def screenshot(
     wid = None
     stem = safe_stem(name)
     if window:
+        need_bins("xdotool")
         r = subprocess.run(["xdotool", "search", "--onlyvisible", "--name", ".*"], timeout=10,
                            env=display_env(st["display"]), capture_output=True, text=True)
         ids = r.stdout.split()
@@ -199,7 +200,14 @@ def _run(script: str, name: str) -> bool:
         a = s.get("action") if isinstance(s, dict) else None
         try:
             if a == "wait":
-                time.sleep(float(s.get("seconds", 1)))
+                secs = s.get("seconds", 1)
+                try:
+                    secs = float(secs)
+                except (TypeError, ValueError):
+                    raise ValueError(f"wait needs numeric seconds, got {s.get('seconds')!r}")
+                if not 0 <= secs <= 3600:
+                    raise ValueError(f"wait needs seconds 0-3600, got {secs}")
+                time.sleep(secs)
             elif a == "key":
                 if not isinstance(s.get("keys"), str):
                     raise ValueError("key needs a string 'keys'")
@@ -228,12 +236,18 @@ def _run(script: str, name: str) -> bool:
             rprint(f"[bold red]  [{i}] {a} FAIL: xdotool exit {e.returncode}[/]")
             ok = False
             break
+        except subprocess.TimeoutExpired:
+            rprint(f"[bold red]  [{i}] {a} FAIL: xdotool timed out[/]")
+            ok = False
+            break
         try:
-            _shot(name)
+            shot = _shot(name)
         except SystemExit as e:
             rprint(f"[bold red]  [{i}] {a} FAIL: capture: {e}[/]")
             ok = False
             break
+        if i == 0:
+            rprint(f"[dim]first frame: {shot}[/]")
     rprint("[bold green]PASS[/]" if ok else "[bold red]FAIL[/]")
     return ok
 
@@ -249,7 +263,7 @@ def record(
     _require_linux("record")
     need_bins("ffmpeg", "ffprobe")
     st = need_session(name)
-    out = out or str(_shots_dir() / f"{name}.mp4")
+    out = out or str(_shots_dir() / f"{safe_stem(name)}.mp4")
     if Path(out).is_dir():
         raise SystemExit(f"cannot write {out}: is a directory")
     if not (0 < seconds <= 3600):
@@ -268,7 +282,11 @@ def record(
     except OSError as e:
         raise SystemExit(f"cannot write {tmp_out}: {e}")
     errlog = Path(f"/tmp/boaz-{safe_stem(name)}-ff.log")
-    with errlog.open("wb") as ef:
+    try:
+        ef = errlog.open("wb")
+    except OSError as e:
+        raise SystemExit(f"cannot open ffmpeg log {errlog}: {e}")
+    with ef:
         ff = subprocess.Popen(
             ["ffmpeg", "-y", "-f", "x11grab", "-draw_mouse", "0", "-r", "10", "-i", st["display"],
              "-vcodec", "libx264", "-preset", "ultrafast", tmp_out],
@@ -341,9 +359,13 @@ def log(name: str = typer.Option("app", help="Session name"),
     """Show the headless app's stdout/stderr (why no window yet?)."""
     _require_linux("log")
     p = Path(f"/tmp/boaz-{safe_stem(name)}.log")
-    if not p.exists():
+    if not p.is_file():
         raise SystemExit(f"No log for '{name}'.")
-    rprint("".join(p.read_text(errors="replace").splitlines(True)[-lines:]))
+    try:
+        text = p.read_text(errors="replace")
+    except OSError as e:
+        raise SystemExit(f"cannot read log {p}: {e}")
+    rprint("".join(text.splitlines(True)[-lines:]))
 
 
 @app.command()

@@ -29,8 +29,15 @@ GLOBAL_LOCK = Path('/tmp/.boaz-alloc.lock')
 
 def sessions_dir() -> Path:
     """Per-invocation override so parallel agents/CI never share a pool."""
-    d = Path(os.environ.get("BOAZ_SESSION_DIR", str(Path.home() / ".cache" / "boaz" / "sessions")))
-    d.mkdir(parents=True, exist_ok=True)
+    d = Path(os.environ.get("BOAZ_SESSION_DIR", str(Path.home() / ".cache" / "boaz" / "sessions"))).expanduser()
+    try:
+        d = d.resolve()
+    except OSError:
+        pass
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise SystemExit(f"cannot create session dir {d}: {e} (check BOAZ_SESSION_DIR)")
     return d
 
 
@@ -71,7 +78,9 @@ def need_session(name: str) -> dict:
     st = load(name)
     disp = st.get("display")
     app_pid = st.get("app")
-    if (not isinstance(disp, str) or not disp.startswith(":") or not disp[1:].isdigit()
+    in_range = (isinstance(disp, str) and disp.startswith(":") and disp[1:].isdigit()
+                and FIRST_DISPLAY <= int(disp[1:]) <= LAST_DISPLAY)
+    if (not in_range
             or not isinstance(app_pid, int) or isinstance(app_pid, bool) or app_pid <= 0):
         path = session_path(name)
         if Path(path).exists():
@@ -86,7 +95,10 @@ def save(name: str, data: dict) -> None:
     """Atomic write: tmp + os.replace, so readers never see half a session."""
     p = Path(session_path(name))
     tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2))
+    try:
+        tmp.write_text(json.dumps(data, indent=2))
+    except OSError as e:
+        raise SystemExit(f"cannot write session {name}: {e}")
     os.replace(tmp, p)
 
 
@@ -210,8 +222,11 @@ def alloc_display() -> int:
     """Locked allocation: global flock + global reservations + socket probes.
     The lock and reservations live in /tmp (shared by all pools) so two
     agents in different BOAZ_SESSION_DIRs can never take the same display."""
-    GLOBAL_LOCK.touch(exist_ok=True)
-    with open(GLOBAL_LOCK, "w") as lock:
+    try:
+        fd = os.open(GLOBAL_LOCK, os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o644)
+    except OSError as e:
+        raise SystemExit(f"cannot lock {GLOBAL_LOCK}: {e}")
+    with os.fdopen(fd, "w") as lock:
         if fcntl is not None:
             fcntl.flock(lock, fcntl.LOCK_EX)
         try:
@@ -295,7 +310,12 @@ def verified_kill(pid: int, expect: str, starttime: str = "") -> bool:
     Escalates TERM -> KILL so TERM-ignoring processes don't survive (D8)."""
     if not expect or not expect.strip():
         return False
-    cmd = proc_cmdline(pid)
+    cmd = ""
+    for _ in range(10):
+        cmd = proc_cmdline(pid)
+        if cmd:
+            break
+        time.sleep(0.1)  # fork/execve race: cmdline momentarily empty
     if not cmd or expect not in cmd:
         return False
     if starttime and proc_stat_starttime(pid) != starttime:
@@ -320,6 +340,8 @@ def pids_in_group(pgid: int) -> list[int]:
     for p in Path("/proc").glob("[0-9]*"):
         try:
             parts = (p / "stat").read_text().rsplit(")", 1)[1].split()
+            if parts[0] == "Z":
+                continue  # zombie: dead, just unreaped — not a survivor
             if int(parts[2]) == pgid and int(p.name) != pgid:  # field 5 = pgrp (NOT session)
                 out.append(int(p.name))
         except (OSError, IndexError, ValueError):
@@ -350,7 +372,7 @@ def wait_for_window(display: str, timeout: float = 30.0) -> str:
     env = display_env(display)
     deadline = time.time() + timeout
     while time.time() < deadline:
-        r = _cap_run(["xdotool", "search", "--onlyvisible", "--name", ".*"],
+        r = _cap_run(["xdotool", "search", "--onlyvisible", ".*"],
                            env=env, capture_output=True, text=True)
         for wid in r.stdout.split():
             q = _cap_run(["xwininfo", "-id", wid], env=env,
@@ -391,6 +413,7 @@ def capture(display: str, path: Path, window: str | None = None) -> Path:
     except OSError as e:
         raise SystemExit(f"cannot write {path}: {e}")
     tmp = path.with_name(path.name + ".tmp.png")
+    tmp.unlink(missing_ok=True)  # never promote a stale frame from a killed grab
     xwd = path.with_name(path.name + ".tmp.xwd")
     errs: list[str] = []
 
