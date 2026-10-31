@@ -10,7 +10,10 @@ Hard rules learned from review (agy 2/10, opencode 3/10 — both proven live):
 """
 from __future__ import annotations
 
-import fcntl
+try:
+    import fcntl  # noqa
+except ImportError:  # Windows: no headless displays anyway
+    fcntl = None  # type: ignore
 import json
 import os
 import shutil
@@ -38,11 +41,28 @@ def session_path(name: str) -> str:
 
 
 def load(name: str) -> dict:
+    """Raw load. Returns {} for missing/unreadable files (kill/ps stay total)."""
     p = Path(session_path(name))
     try:
-        return json.loads(p.read_text())
+        data = json.loads(p.read_text())
+        return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
+
+
+def need_session(name: str) -> dict:
+    """Validated load for commands that drive the app. Loud, no KeyError ever."""
+    st = load(name)
+    disp = st.get("display")
+    if (not isinstance(disp, str) or not disp.startswith(":") or not disp[1:].isdigit()
+            or not isinstance(st.get("app"), int)):
+        path = session_path(name)
+        if Path(path).exists():
+            raise SystemExit(
+                f"corrupt session file for '{name}' (needs display + app pid). "
+                f"`boaz kill --name {name}` clears it.")
+        raise SystemExit("No session '%s'. Run: boaz launch --name %s '<cmd>' first." % (name, name))
+    return st
 
 
 def save(name: str, data: dict) -> None:
@@ -105,8 +125,24 @@ def display_taken(num: int) -> bool:
     return False
 
 
+def _prune_reservations() -> None:
+    now = time.time()
+    for r in SESSIONS.glob(".reserve-*"):
+        try:
+            if now - r.stat().st_mtime > 60:
+                r.unlink()
+        except OSError:
+            pass
+
+
 def claimed_displays() -> set[int]:
+    _prune_reservations()
     out: set[int] = set()
+    for r in SESSIONS.glob(".reserve-*"):
+        try:
+            out.add(int(r.name.split("-")[1]))
+        except (IndexError, ValueError):
+            pass
     for p in SESSIONS.glob("*.json"):
         try:
             d = json.loads(p.read_text()).get("display", "")
@@ -121,15 +157,26 @@ def alloc_display() -> int:
     """Locked allocation: flock + live session files + socket probes."""
     ALLOC_LOCK.touch(exist_ok=True)
     with open(ALLOC_LOCK, "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        if fcntl is not None:
+            fcntl.flock(lock, fcntl.LOCK_EX)
         try:
             claimed = claimed_displays()
             for n in range(FIRST_DISPLAY, LAST_DISPLAY + 1):
                 if n not in claimed and not display_taken(n):
+                    Path(SESSIONS / f".reserve-{n}").touch()
                     return n
         finally:
-            fcntl.flock(lock, fcntl.LOCK_UN)
+            if fcntl is not None:
+                fcntl.flock(lock, fcntl.LOCK_UN)
     raise SystemExit(f"No free display in :{FIRST_DISPLAY}-:{LAST_DISPLAY}. `boaz kill --all` or `boaz ps`.")
+
+
+def confirm_display(num: int) -> None:
+    """Reservation fulfilled: the server answers, release the hold."""
+    try:
+        Path(SESSIONS / f".reserve-{num}").unlink()
+    except FileNotFoundError:
+        pass
 
 
 def display_env(display: str) -> dict[str, str]:
@@ -208,7 +255,7 @@ def _variance_ok(path: Path) -> bool:
         small = Image.open(path).convert("L").resize((160, 100))
         return (ImageStat.Stat(small).stddev[0] or 0) > 1.5
     except Exception:
-        return True  # PIL missing or undecodable here is handled by _valid_png
+        return False  # undecodable frames never pass the gate
 
 
 def _valid_png(path: Path) -> bool:
@@ -219,50 +266,73 @@ def _valid_png(path: Path) -> bool:
 
 
 def capture(display: str, path: Path, window: str | None = None) -> Path:
-    """ffmpeg x11grab first, xwd per-window, scrot root last. Verified non-flat.
+    """ffmpeg x11grab first, xwd, scrot root last. Content-gated, atomic.
 
+    Writes to a tmp sibling, validates (decodable PNG + pixel variance), then
+    os.replace. A blank frame leaves NO file behind and exits non-zero.
     Raises SystemExit (no traceback to agents) with the failing tool's stderr.
     """
-    need_bins("ffmpeg", "scrot")
+    need_bins("ffmpeg")
     path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp.png")
+    xwd = path.with_name(path.name + ".tmp.xwd")
     errs: list[str] = []
+
+    def done() -> Path | None:
+        if _valid_png(tmp) and _variance_ok(tmp):
+            os.replace(tmp, path)
+            return path
+        return None
+
+    def blank() -> SystemExit:
+        tmp.unlink(missing_ok=True)
+        return SystemExit(f"capture on {display} is blank (no pixel variance) — is the app still running?")
+
     if window:
         need_bins("xwd", "convert")
-        xwd = path.with_suffix(".xwd")
         r = subprocess.run(["xwd", "-display", display, "-id", window, "-out", str(xwd)],
                            capture_output=True, text=True)
         if r.returncode == 0:
-            r = subprocess.run(["convert", str(xwd), str(path)], capture_output=True, text=True)
+            r = subprocess.run(["convert", str(xwd), str(tmp)], capture_output=True, text=True)
             xwd.unlink(missing_ok=True)
-            if r.returncode == 0 and _valid_png(path) and _variance_ok(path):
-                return path
-            if _valid_png(path):
-                raise SystemExit(f"capture on {display} is blank (stddev≈0) — is the app still running?")
+            if r.returncode == 0:
+                if _valid_png(tmp):
+                    hit = done()
+                    if hit:
+                        return hit
+                    raise blank()
+                raise SystemExit(f"screenshot failed on {display}: xwd produced no PNG")
         errs.append(f"xwd: {(r.stderr or '').strip()[:160]}")
     else:
         r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "x11grab", "-draw_mouse", "0",
-                            "-i", f"{display}+0,0", "-frames:v", "1", str(path)],
+                            "-i", f"{display}+0,0", "-frames:v", "1", str(tmp)],
                            capture_output=True, text=True)
-        if r.returncode == 0 and _valid_png(path):
-            if _variance_ok(path):
-                return path
-            raise SystemExit(f"capture on {display} is blank (stddev≈0) — is the app still running?")
+        if r.returncode == 0 and _valid_png(tmp):
+            hit = done()
+            if hit:
+                return hit
+            raise blank()
         errs.append(f"ffmpeg: {(r.stderr or '').strip()[:160]}")
         need_bins("xwd", "convert")
-        xwd = path.with_suffix(".xwd")
         r = subprocess.run(["xwd", "-display", display, "-root", "-out", str(xwd)],
                            capture_output=True, text=True)
         if r.returncode == 0:
-            r = subprocess.run(["convert", str(xwd), str(path)], capture_output=True, text=True)
+            r = subprocess.run(["convert", str(xwd), str(tmp)], capture_output=True, text=True)
             xwd.unlink(missing_ok=True)
-            if r.returncode == 0 and _valid_png(path) and _variance_ok(path):
-                return path
+            if r.returncode == 0 and _valid_png(tmp):
+                hit = done()
+                if hit:
+                    return hit
+                raise blank()
         errs.append(f"xwd-root: {(r.stderr or '').strip()[:160]}")
     env = display_env(display)
-    r = subprocess.run(["scrot", "-z", str(path)], env=env, capture_output=True, text=True)
-    if r.returncode == 0 and _valid_png(path):
-        if _variance_ok(path):
-            return path
-        raise SystemExit(f"capture on {display} is blank (stddev≈0) — is the app still running?")
+    need_bins("scrot")
+    r = subprocess.run(["scrot", "-z", str(tmp)], env=env, capture_output=True, text=True)
+    if r.returncode == 0 and _valid_png(tmp):
+        hit = done()
+        if hit:
+            return hit
+        raise blank()
     errs.append(f"scrot: {(r.stderr or '').strip()[:160]}")
+    tmp.unlink(missing_ok=True)
     raise SystemExit(f"screenshot failed on {display}: {' | '.join(errs)}")

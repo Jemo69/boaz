@@ -21,9 +21,9 @@ from rich import print as rprint
 
 from desktop import (
     FIRST_DISPLAY, HEIGHT, LAST_DISPLAY, SESSIONS, WIDTH, XVFB_ARGV0,
-    alloc_display, capture, display_env, drop_session, load,
-    proc_cmdline, proc_stat_starttime, save, verified_kill,
-    wait_for_window, which_or_hint, need_bins, xvfb_bin,
+    alloc_display, capture, confirm_display, display_env, drop_session, load,
+    need_session, proc_cmdline, proc_stat_starttime, save, session_path, verified_kill,
+    wait_for_window, need_bins, xvfb_bin,
 )
 
 sys.stdout.reconfigure(line_buffering=True)
@@ -45,9 +45,7 @@ def _require_linux(cmd: str) -> None:
 
 
 def _shot(name: str, out: str | None = None) -> str:
-    st = load(name)
-    if not st:
-        raise SystemExit(f"No session '{name}'. `boaz launch --name {name} \"<cmd>\"` first.")
+    st = need_session(name)
     if out is None:
         n = len(list(_shots_dir().glob(f"{name}-*.png")))
         out = str(_shots_dir() / f"{name}-{n:03d}.png")
@@ -76,13 +74,14 @@ def launch(
     time.sleep(1.0)
     if xvfb.poll() is not None:
         raise SystemExit(f"Xvfb died on startup for {display}. See `boaz doctor`.")
+    confirm_display(num)
     log = Path(f"/tmp/boaz-{name}.log")
     with log.open("wb") as lf:
         proc = subprocess.Popen(cmd, shell=True, env=display_env(display),
                                 stdout=lf, stderr=subprocess.STDOUT,
                                 start_new_session=True)  # own process group: kill takes children too
-    save(name, {"xvfb": xvfb.pid, "app": proc.pid,
-                "app_starttime": proc_stat_starttime(proc.pid),
+    save(name, {"xvfb": xvfb.pid, "xvfb_starttime": proc_stat_starttime(xvfb.pid),
+                "app": proc.pid, "app_starttime": proc_stat_starttime(proc.pid),
                 "cmd": cmd, "display": display, "name": name})
     try:
         wid = wait_for_window(display, timeout=wait)
@@ -104,9 +103,7 @@ def screenshot(
 ) -> None:
     """Capture the headless display to PNG. Agent reads this with vision."""
     _require_linux("screenshot")
-    st = load(name)
-    if not st:
-        raise SystemExit(f"No session '{name}'.")
+    st = need_session(name)
     wid = None
     if window:
         r = subprocess.run(["xdotool", "search", "--onlyvisible", "--name", ".*"],
@@ -126,14 +123,13 @@ def run(
     name: str = typer.Option("app", help="Session name"),
 ) -> None:
     """Drive the headless app (xdotool) + screenshot every step. Prints PASS/FAIL."""
-    _run(script, name)
+    ok = _run(script, name)
+    raise typer.Exit(0 if ok else 1)
 
 
-def _run(script: str, name: str) -> None:
+def _run(script: str, name: str) -> bool:
     _require_linux("run")
-    st = load(name)
-    if not st:
-        raise SystemExit(f"No session '{name}'.")
+    st = need_session(name)
     try:
         steps = json.loads(Path(script).read_text())
     except OSError as e:
@@ -150,11 +146,19 @@ def _run(script: str, name: str) -> None:
             if a == "wait":
                 time.sleep(float(s.get("seconds", 1)))
             elif a == "key":
+                if not isinstance(s.get("keys"), str):
+                    raise ValueError("key needs a string 'keys'")
                 subprocess.run(["xdotool", "key", s["keys"]], env=env, check=True)
             elif a == "type":
+                if not isinstance(s.get("text"), str):
+                    raise ValueError("type needs a string 'text'")
                 subprocess.run(["xdotool", "type", s["text"]], env=env, check=True)
             elif a == "click":
-                subprocess.run(["xdotool", "mousemove", str(s["x"]), str(s["y"]), "click", "1"],
+                try:
+                    cx, cy = int(s["x"]), int(s["y"])
+                except (TypeError, ValueError):
+                    raise ValueError(f"click needs integer x/y, got {s.get('x')!r},{s.get('y')!r}")
+                subprocess.run(["xdotool", "mousemove", str(cx), str(cy), "click", "1"],
                                env=env, check=True)
             elif a == "screenshot":
                 pass  # every step screenshots anyway
@@ -171,7 +175,7 @@ def _run(script: str, name: str) -> None:
             break
         _shot(name)
     rprint("[bold green]PASS[/]" if ok else "[bold red]FAIL[/]")
-    raise typer.Exit(0 if ok else 1)
+    return ok
 
 
 @app.command()
@@ -188,22 +192,28 @@ def record(
     if not st:
         raise SystemExit(f"No session '{name}'.")
     out = out or str(_shots_dir() / f"{name}.mp4")
-    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    try:
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise SystemExit(f"cannot write {out}: {e}")
     errlog = Path(f"/tmp/boaz-{name}-ff.log")
     with errlog.open("wb") as ef:
         ff = subprocess.Popen(
             ["ffmpeg", "-y", "-f", "x11grab", "-r", "10", "-i", st["display"],
              "-vcodec", "libx264", "-preset", "ultrafast", out],
             stdout=subprocess.DEVNULL, stderr=ef)
+        script_ok = True
         try:
             if script:
-                _run(script, name)
+                script_ok = _run(script, name)
             else:
                 time.sleep(seconds)
                 rprint(f"[dim]static capture {seconds}s[/]")
         finally:
             ff.terminate()
             ff.wait()
+        if script and not script_ok:
+            raise SystemExit(f"record aborted: script {script} FAILED, no MP4 verified")
     frames = subprocess.run(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
                              "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", out],
                             capture_output=True, text=True)
@@ -217,9 +227,8 @@ def record(
 @app.command()
 def show(name: str = typer.Option("app", help="Session name")) -> None:
     """Relaunch the same command visibly for the human. Only when READY_FOR_HUMAN."""
-    st = load(name)
-    if not st:
-        raise SystemExit(f"No session '{name}'.")
+    _require_linux("show")
+    st = need_session(name)
     rprint(f"[yellow]Re-launching visibly for YOU to test:[/] {st['cmd']}")
     rprint("[dim]Headless session keeps running untouched.[/]")
     subprocess.Popen(st["cmd"], shell=True)
@@ -229,6 +238,7 @@ def show(name: str = typer.Option("app", help="Session name")) -> None:
 def log(name: str = typer.Option("app", help="Session name"),
         lines: int = typer.Option(30, help="Tail lines")) -> None:
     """Show the headless app's stdout/stderr (why no window yet?)."""
+    _require_linux("log")
     p = Path(f"/tmp/boaz-{name}.log")
     if not p.exists():
         raise SystemExit(f"No log for '{name}'.")
@@ -241,27 +251,52 @@ def kill(name: str = typer.Option("app", help="Session name (or --all)"),
          sweep: bool = typer.Option(False, help="Also reap orphan boaz Xvfb servers (argv[0]-marked only)"),
          quiet: bool = typer.Option(False, help="No output")) -> None:
     """Kill headless session(s). Verifies cmdline+starttime — never kills strangers."""
+    _require_linux("kill")
     _kill([p.stem for p in SESSIONS.glob("*.json")] if all else [name], sweep, quiet)
 
 
+def _app_is_ours(pid: int, st: dict) -> bool:
+    """Identity for apps: recorded starttime must match (pid reuse gives a
+    new starttime, argv rewrites don't matter). Falls back to the cmd
+    substring only for sessions predating starttime recording."""
+    if not proc_cmdline(pid):
+        return False
+    recorded = st.get("app_starttime", "")
+    if recorded:
+        return proc_stat_starttime(pid) == recorded
+    cmd = st.get("cmd", "")
+    return bool(cmd and cmd[:40] in proc_cmdline(pid))
+
+
 def _kill(names: list[str], sweep: bool, quiet: bool) -> None:
+    from pathlib import Path as _P
     for n in names:
         st = load(n)
         if not st:
+            # Unreadable/corrupt file: clear it so the pool can't deadlock (defect 7).
+            p = _P(session_path(n))
+            if p.exists():
+                try:
+                    p.unlink()
+                    if not quiet:
+                        rprint(f"[dim]{n}: unreadable session file cleared.[/]")
+                except OSError:
+                    pass
             continue
-        app_ok = verified_kill(int(st["app"]), (st.get("cmd") or "")[:40],
-                               st.get("app_starttime", "")) if st.get("app") else True
-        if st.get("app") and not app_ok:
-            if not quiet:
-                rprint(f"[dim]{n}:app already gone or PID recycled — session kept so nothing is lost.[/]")
-            continue  # spared process stays tracked; never forget a live one
-        if st.get("app"):
+        app_pid = st.get("app")
+        if app_pid and proc_cmdline(int(app_pid)):
+            if not _app_is_ours(int(app_pid), st):
+                if not quiet:
+                    rprint(f"[dim]{n}:app alive but identity unverified (PID reuse?) — session kept so nothing is lost.[/]")
+                continue  # spared process stays tracked; never forget a live one
+            verified_kill(int(app_pid), (st.get("cmd") or "")[:40], st.get("app_starttime", ""))
             try:
-                os.killpg(int(st["app"]), signal.SIGTERM)  # process group: reap shell children too
+                os.killpg(int(app_pid), signal.SIGTERM)  # process group: reap shell children too
             except (ProcessLookupError, PermissionError, OSError):
                 pass
+        # App dead, absent, or just reaped: still reap OUR Xvfb (marker + starttime) and drop.
         if st.get("xvfb"):
-            verified_kill(int(st["xvfb"]), XVFB_ARGV0)
+            verified_kill(int(st["xvfb"]), XVFB_ARGV0, st.get("xvfb_starttime", ""))
         drop_session(n)
     if sweep:
         claimed: set[int] = set()
@@ -300,6 +335,7 @@ def _x11_server_pids() -> list[int]:
 @app.command()
 def ps() -> None:
     """List live headless sessions (name, display, pid, cmd)."""
+    _require_linux("ps")
     found = False
     for p in sorted(SESSIONS.glob("*.json")):
         try:

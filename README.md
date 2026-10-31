@@ -63,5 +63,5 @@ The agent reads every step as PNG; you look only at the final MP4 or `boaz show`
 ## Tests
 
 ```bash
-uv run pytest tests/ -q   # 5 live-session tests: cycle, run PASS/FAIL, record frames, isolation, kill-safety
+uv run pytest tests/ -q   # 10 live-session tests: cycle, run PASS/FAIL, bad JSON, record+script, concurrency, blank-gate, crashed-kill, corrupt, kill-safety, sweep
 ```

@@ -106,14 +106,51 @@ def test_run_bad_json_no_traceback(names):
 
 @needs_linux
 @needs_xlogo
-def test_record_produces_frames(names):
+def test_record_with_script_verifies_frames(names):
     n = tag("t-rec"); names.append(n)
     boaz("launch", str(XLOGO), "--name", n, "--wait", "15")
     out = f"/tmp/boaz-{n}.mp4"
     r = boaz("record", "--name", n, "--out", out, "--seconds", "3")
     assert r.returncode == 0 and "frames" in r.stdout, r.stdout + r.stderr
     m = re.search(r"\((\d+) frames\)", r.stdout)
-    assert m and int(m.group(1)) >= 20, f"expected >=20 frames @10fps/3s: {r.stdout}"
+    assert m and int(m.group(1)) >= 20
+    bad = Path("/tmp/boaz-fail.json"); bad.write_text(json.dumps([{"action": "bogus"}]))
+    r = boaz("record", "--name", n, "--out", "/tmp/boaz-dead.mp4", "--script", str(bad))
+    assert r.returncode != 0 and "Traceback" not in r.stdout + r.stderr
+    assert not Path("/tmp/boaz-dead.mp4").exists()
+
+
+@needs_linux
+@needs_xlogo
+def test_crashed_app_kill_reaps_display(names):
+    n = tag("t-crash"); names.append(n)
+    r = boaz("launch", "sleep 2", "--name", n, "--wait", "6")
+    assert r.returncode in (0, 2), r.stdout + r.stderr
+    st = session(n)
+    disp, xpid = st.get("display"), st.get("xvfb")
+    assert disp, f"no session saved: {r.stdout}"
+    time.sleep(3)
+    r = boaz("kill", "--name", n)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert session(n) == {}
+    assert not Path(f"/proc/{xpid}").exists(), "Xvfb must be reaped, not leaked"
+    from desktop import display_taken
+    assert not display_taken(int(disp[1:])), "display must be free again"
+
+
+@needs_linux
+def test_corrupt_session_fails_clean_and_clears(names):
+    n = tag("t-corrupt")
+    p = Path.home() / f".cache/boaz/sessions/{n}.json"
+    p.write_text('{"cmd": "x"}')
+    try:
+        r = boaz("screenshot", "--name", n)
+        assert r.returncode != 0 and "Traceback" not in r.stdout + r.stderr
+        assert "corrupt" in (r.stdout + r.stderr).lower()
+        r = boaz("kill", "--name", n)
+        assert r.returncode == 0 and not p.exists()
+    finally:
+        p.unlink(missing_ok=True)
 
 
 @needs_linux
@@ -136,20 +173,25 @@ def test_concurrent_launches_isolate(names):
 
 @needs_linux
 def test_blank_capture_refuses_exit_zero(names):
-    """Empty Xvfb + no app: screenshot must fail loudly, never hand over a black frame."""
-    from desktop import alloc_display, display_env
+    """boaz screenshot on an empty display: non-zero exit, no traceback, no file left."""
+    from desktop import alloc_display, confirm_display
     num = alloc_display()
-    xvfb = subprocess.Popen(["/home/jemo/.local/bin/Xvfb", f":{num}", "-screen", "0", "800x600x24"],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    xvfb = subprocess.Popen([str(Path.home() / ".local" / "bin" / "Xvfb"),
+                               f":{num}", "-screen", "0", "800x600x24"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(1.0)
+    n = tag("t-blank"); names.append(n)
     try:
-        r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "x11grab", "-draw_mouse", "0",
-                            "-i", f":{num}+0,0", "-frames:v", "1", "/tmp/boaz-blank-probe.png"],
-                           capture_output=True, text=True, env=display_env(f":{num}"))
-        assert r.returncode == 0
-        from PIL import Image, ImageStat
-        assert ImageStat.Stat(Image.open("/tmp/boaz-blank-probe.png").convert("L")).stddev[0] < 1.5
+        confirm_display(num)
+        Path.home().joinpath(f".cache/boaz/sessions/{n}.json").write_text(json.dumps(
+            {"display": f":{num}", "app": 1, "cmd": "gone", "name": n}))
+        r = boaz("screenshot", "--name", n, "--out", f"/tmp/boaz-{n}-blank.png")
+        assert r.returncode != 0, "blank capture exited 0: " + r.stdout
+        assert "Traceback" not in r.stdout + r.stderr
+        assert "blank" in (r.stdout + r.stderr).lower()
+        assert not Path(f"/tmp/boaz-{n}-blank.png").exists(), "blank frame must not be left behind"
     finally:
+        Path.home().joinpath(f".cache/boaz/sessions/{n}.json").unlink(missing_ok=True)
         xvfb.terminate(); xvfb.wait()
 
 
