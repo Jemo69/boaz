@@ -7,15 +7,14 @@ Session names are uuid-prefixed per test; teardown kills only its own.
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 import uuid
 from pathlib import Path
 
 import pytest
-import tempfile
 from desktop import sessions_dir
-os.environ['BOAZ_SESSION_DIR'] = tempfile.mkdtemp(prefix='boaz-test-')
 
 BOAZ = ["uv", "run", "python", "main.py"]
 REPO = Path(__file__).resolve().parent.parent
@@ -285,10 +284,12 @@ def test_record_blank_dead_app_refuses_and_cleans(names):
 @needs_linux
 def test_bad_geometry_fails_fast_and_releases(names):
     n = tag("t-geo"); names.append(n)
+    from desktop import claimed_displays, sessions_dir
+    before = set(sessions_dir().glob(".reserve-*"))
     r = boaz("launch", "sleep 30", "--name", n, "--width", "0", "--wait", "5")
     assert r.returncode != 0 and "320" in (r.stdout + r.stderr)
-    from desktop import claimed_displays
-    assert not [d for d in claimed_displays()], f"reservation leaked: {claimed_displays()}"
+    leaked = set(sessions_dir().glob(".reserve-*")) - before
+    assert not leaked, f"reservation leaked: {[p.name for p in leaked]}"
 
 
 @needs_linux
@@ -345,3 +346,23 @@ def test_record_keeps_user_file_on_failure(names):
     finally:
         (sessions_dir() / f"{n}.json").unlink(missing_ok=True)
         keep.unlink(missing_ok=True)
+
+
+@needs_linux
+@needs_xlogo
+def test_sweep_spares_other_pool(names):
+    """Two pools, one display server each: sweep in pool B must spare pool A's Xvfb."""
+    import tempfile
+    pool_b = tempfile.mkdtemp(prefix="boaz-poolB-")
+    env_b = dict(os.environ, BOAZ_SESSION_DIR=pool_b)
+    n = tag("t-pool"); names.append(n)
+    r = boaz("launch", str(XLOGO), "--name", n, "--wait", "15")
+    assert r.returncode == 0, r.stdout + r.stderr
+    xpid = session(n)["xvfb"]
+    try:
+        rb = subprocess.run(BOAZ + ["kill", "--all", "--sweep", "--quiet"], cwd=REPO,
+                            capture_output=True, text=True, env=env_b)
+        assert rb.returncode == 0, rb.stdout + rb.stderr
+        assert Path(f"/proc/{xpid}").exists(), "other pool's Xvfb was swept"
+    finally:
+        shutil.rmtree(pool_b, ignore_errors=True)

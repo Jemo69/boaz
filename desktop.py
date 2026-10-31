@@ -56,12 +56,19 @@ def load(name: str) -> dict:
         return {}
 
 
+def safe_stem(name: str) -> str:
+    """Filesystem-safe stem for session-derived paths (logs, shots).
+    Session names may contain slashes; paths must never escape their dir."""
+    return Path(session_path(name)).stem
+
+
 def need_session(name: str) -> dict:
     """Validated load for commands that drive the app. Loud, no KeyError ever."""
     st = load(name)
     disp = st.get("display")
+    app_pid = st.get("app")
     if (not isinstance(disp, str) or not disp.startswith(":") or not disp[1:].isdigit()
-            or not isinstance(st.get("app"), int)):
+            or not isinstance(app_pid, int) or isinstance(app_pid, bool) or app_pid <= 0):
         path = session_path(name)
         if Path(path).exists():
             raise SystemExit(
@@ -119,7 +126,18 @@ def display_taken(num: int) -> bool:
     except OSError:
         pass
     if Path(f"/tmp/.X11-unix/X{num}").exists():
-        return True
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(0.3)
+            s.connect(f"/tmp/.X11-unix/X{num}")
+            s.close()
+            return True  # live listener behind the fs socket
+        except OSError:
+            try:
+                s.close()
+            except Exception:
+                pass
+            # stale socket file, no listener: fall through to other probes
     try:
         lock_pid = Path(f"/tmp/.X{num}-lock").read_text().strip().split()[0]
         int(lock_pid)  # garbage content: not a real lock
@@ -233,6 +251,23 @@ def proc_cmdline(pid: int) -> str:
         return ""
 
 
+def proc_environ(pid: int) -> dict[str, str]:
+    """Environ of a PID, for pool-ownership checks (D1.1)."""
+    out: dict[str, str] = {}
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    except OSError:
+        return out
+    for item in raw:
+        if b"=" in item:
+            k, v = item.split(b"=", 1)
+            try:
+                out[k.decode()] = v.decode(errors="replace")
+            except ValueError:
+                continue
+    return out
+
+
 def verified_kill(pid: int, expect: str, starttime: str = "") -> bool:
     """Kill pid only if cmdline still contains `expect` (non-empty) and the
     starttime matches when given. Catches PermissionError. Never kills strangers.
@@ -264,7 +299,7 @@ def pids_in_group(pgid: int) -> list[int]:
     for p in Path("/proc").glob("[0-9]*"):
         try:
             parts = (p / "stat").read_text().rsplit(")", 1)[1].split()
-            if int(parts[3]) == pgid and int(p.name) != pgid:
+            if int(parts[2]) == pgid and int(p.name) != pgid:  # field 5 = pgrp (NOT session)
                 out.append(int(p.name))
         except (OSError, IndexError, ValueError):
             continue

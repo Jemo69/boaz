@@ -22,7 +22,7 @@ from rich import print as rprint
 from desktop import (
     FIRST_DISPLAY, HEIGHT, LAST_DISPLAY, WIDTH, XVFB_ARGV0,
     alloc_display, capture, confirm_display, display_env, display_taken, drop_session, load,
-    need_session, proc_cmdline, proc_stat_starttime, release_display, save, session_path, sessions_dir, verified_kill,
+    need_session, proc_cmdline, proc_environ, proc_stat_starttime, release_display, safe_stem, save, session_path, sessions_dir, verified_kill,
     wait_for_window, need_bins, xvfb_bin,
 )
 
@@ -51,9 +51,10 @@ def _require_linux(cmd: str) -> None:
 
 def _shot(name: str, out: str | None = None) -> str:
     st = need_session(name)
+    stem = safe_stem(name)
     if out is None:
-        n = len(list(_shots_dir().glob(f"{name}-*.png")))
-        out = str(_shots_dir() / f"{name}-{n + 1:03d}.png")
+        n = len(list(_shots_dir().glob(f"{stem}-*.png")))
+        out = str(_shots_dir() / f"{stem}-{n + 1:03d}.png")
     return str(capture(st["display"], Path(out)))
 
 
@@ -100,9 +101,18 @@ def launch(
         release_display(num)
         raise
     confirm_display(num)
-    log = Path(f"/tmp/boaz-{Path(session_path(name)).stem}.log")
+    log = Path(f"/tmp/boaz-{safe_stem(name)}.log")
     try:
-        with log.open("wb") as lf:
+        lf = log.open("wb")
+    except OSError as e:
+        try:
+            xvfb.kill()
+        except OSError:
+            pass
+        release_display(num)
+        raise SystemExit(f"cannot open log {log}: {e}")
+    try:
+        with lf:
             proc = subprocess.Popen(cmd, shell=True, env=display_env(display),
                                     stdout=lf, stderr=subprocess.STDOUT,
                                     start_new_session=True)  # own process group: kill takes children too
@@ -140,6 +150,7 @@ def screenshot(
     _require_linux("screenshot")
     st = need_session(name)
     wid = None
+    stem = safe_stem(name)
     if window:
         r = subprocess.run(["xdotool", "search", "--onlyvisible", "--name", ".*"],
                            env=display_env(st["display"]), capture_output=True, text=True)
@@ -149,7 +160,7 @@ def screenshot(
         raise SystemExit(f"No mapped window on {st['display']} yet.")
     rprint(_shot(name, out) if wid is None
            else str(capture(st["display"], Path(out) if out else
-                            _shots_dir() / f"{name}-win-{len(list(_shots_dir().glob(f'{name}-win-*.png'))):03d}.png", wid)))
+                            _shots_dir() / f"{stem}-win-{len(list(_shots_dir().glob(f'{stem}-win-*.png'))):03d}.png", wid)))
 
 
 @app.command()
@@ -243,7 +254,7 @@ def record(
         pass
     except OSError as e:
         raise SystemExit(f"cannot write {tmp_out}: {e}")
-    errlog = Path(f"/tmp/boaz-{Path(session_path(name)).stem}-ff.log")
+    errlog = Path(f"/tmp/boaz-{safe_stem(name)}-ff.log")
     with errlog.open("wb") as ef:
         ff = subprocess.Popen(
             ["ffmpeg", "-y", "-f", "x11grab", "-draw_mouse", "0", "-r", "10", "-i", st["display"],
@@ -312,7 +323,7 @@ def log(name: str = typer.Option("app", help="Session name"),
         lines: int = typer.Option(30, help="Tail lines")) -> None:
     """Show the headless app's stdout/stderr (why no window yet?)."""
     _require_linux("log")
-    p = Path(f"/tmp/boaz-{name}.log")
+    p = Path(f"/tmp/boaz-{safe_stem(name)}.log")
     if not p.exists():
         raise SystemExit(f"No log for '{name}'.")
     rprint("".join(p.read_text(errors="replace").splitlines(True)[-lines:]))
@@ -382,28 +393,18 @@ def _kill(names: list[str], sweep: bool, force: bool, quiet: bool) -> list[str]:
                     pass
             continue
         app_pid, xvfb_pid = _coerce_pids(st)
-        if (app_pid is None and xvfb_pid is None
-                and (st.get("app") is not None or st.get("xvfb") is not None)):
-            # Wholly unverifiable: clear only when nothing could be alive.
-            # (PIDs are ints here; non-int garbage can't be resolved to a proc.)
-            raw_app, raw_x = st.get("app"), st.get("xvfb")
-            maybe_alive = any(isinstance(v, int) and not isinstance(v, bool)
-                              and proc_cmdline(v) for v in (raw_app, raw_x))
-            if maybe_alive:
-                kept.append(n)
-                if not quiet:
-                    rprint(f"[dim]{n}: corrupt pids but a process may be alive — kept. Use --force to drop.[/]")
-                continue
+        if app_pid is None and xvfb_pid is None:
+            # Wholly unverifiable (non-int garbage or no pids at all): ints
+            # would have coerced, so nothing here can reference a live process.
+            # Drop unconditionally — keeping it only deadlocks the pool.
             try:
                 Path(session_path(n)).unlink()
                 if not quiet:
-                    rprint(f"[dim]{n}: wrong-typed session file cleared (nothing alive).[/]")
+                    rprint(f"[dim]{n}: corrupt session file cleared (nothing verifiable).[/]")
             except OSError:
                 pass
             continue
         if st.get("boot_id") not in (None, "", _boot()):
-            if xvfb_pid:
-                verified_kill(xvfb_pid, XVFB_ARGV0, st.get("xvfb_starttime", ""))
             drop_session(n)
             if not quiet:
                 rprint(f"[dim]{n}: stale (older boot) — session dropped.[/]")
@@ -469,6 +470,11 @@ def _kill(names: list[str], sweep: bool, force: bool, quiet: bool) -> list[str]:
                 continue
         for pid in _x11_server_pids():
             if pid in claimed:
+                continue
+            # Cross-pool safety: only reap servers from THIS pool. Another
+            # agent's boaz (different BOAZ_SESSION_DIR) is never our orphan.
+            owner = proc_environ(pid).get("BOAZ_SESSION_DIR", "")
+            if owner and owner.rstrip("/") != str(sessions_dir()).rstrip("/"):
                 continue
             st_match = proc_stat_starttime(pid)
             if verified_kill(pid, XVFB_ARGV0, st_match) and not quiet:

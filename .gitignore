@@ -1,0 +1,5 @@
+shots/*.png
+shots/*.mp4
+/tmp/
+__pycache__/
+.pytest_cache/
