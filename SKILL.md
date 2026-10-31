@@ -62,6 +62,8 @@ deletes — a session it refused to kill. `kill --all --sweep` reaps only
 boaz-marked Xvfb servers (`argv[0]=boaz-Xvfb`); a foreign plain `Xvfb` always
 survives. Blank captures AND blank recordings exit non-zero with "blank" and leave no file behind (tmp + os.replace).
 
+Parallel agents: export a private BOAZ_SESSION_DIR per loop so pools never collide.
+
 Internal rule for contributors: never call a typer command from another
 command — `typer.Option` defaults are truthy `OptionInfo` objects off-CLI
 (this once caused `launch` to `kill --all` every sibling session). Always go

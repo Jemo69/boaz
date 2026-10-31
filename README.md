@@ -11,12 +11,12 @@ boaz run tests/flow.json --name vp                # xdotool script, PASS/FAIL + 
 boaz record --name vp --out shots/tour.mp4        # ffmpeg x11grab, frame-verified
 boaz log --name vp                                # app stdout when no window appears
 boaz show --name vp                               # relaunch VISIBLE — only when READY_FOR_HUMAN
-boaz kill --name vp        # verified PIDs only; --all / --sweep for orphans
+boaz kill --name vp        # verified PIDs only; --force drops stale state; --all / --sweep for orphans (exit 3 if a live process is spared)
 boaz ps                    # live sessions
 boaz doctor                # readiness check for this machine
 ```
 
-Sessions are isolated: each `--name` gets its own DISPLAY (`:99`–`:110`,
+Sessions are isolated: each `--name` gets its own DISPLAY (set BOAZ_SESSION_DIR to fully isolate parallel agents/CI) (`:99`–`:110`,
 probed via TCP + filesystem + abstract sockets) and its own state file, so
 parallel agents don't collide. `kill` verifies `/proc` cmdlines before
 signalling and refuses to kill strangers; `--sweep` reaps orphan Xvfb servers.
