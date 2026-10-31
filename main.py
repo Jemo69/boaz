@@ -20,9 +20,9 @@ import typer
 from rich import print as rprint
 
 from desktop import (
-    FIRST_DISPLAY, HEIGHT, LAST_DISPLAY, SESSIONS, WIDTH, XVFB_ARGV0,
+    FIRST_DISPLAY, HEIGHT, LAST_DISPLAY, WIDTH, XVFB_ARGV0,
     alloc_display, capture, confirm_display, display_env, display_taken, drop_session, load,
-    need_session, proc_cmdline, proc_stat_starttime, release_display, save, session_path, verified_kill,
+    need_session, proc_cmdline, proc_stat_starttime, release_display, save, session_path, sessions_dir, verified_kill,
     wait_for_window, need_bins, xvfb_bin,
 )
 
@@ -71,7 +71,9 @@ def launch(
     for dim, val in (("width", width), ("height", height)):
         if not 320 <= val <= 7680:
             raise SystemExit(f"bad {dim}={val}: want 320-7680 (a real screen size)")
-    _kill([name], sweep=False, force=False, quiet=True)
+    kept = _kill([name], sweep=False, force=False, quiet=True)
+    if name in kept:
+        raise SystemExit(f"session '{name}' kept a live unverified process — refusing to overwrite it. Use --force with kill first.")
     num = alloc_display()
     display = f":{num}"
     xvfb_path = xvfb_bin()
@@ -216,15 +218,19 @@ def record(
     need_bins("ffmpeg", "ffprobe")
     st = need_session(name)
     out = out or str(_shots_dir() / f"{name}.mp4")
+    if Path(out).is_dir():
+        raise SystemExit(f"cannot write {out}: is a directory")
     try:
         Path(out).parent.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         raise SystemExit(f"cannot write {out}: {e}")
+    tmp_out = out + '.tmp.mp4'
+    Path(tmp_out).unlink(missing_ok=True)
     errlog = Path(f"/tmp/boaz-{name}-ff.log")
     with errlog.open("wb") as ef:
         ff = subprocess.Popen(
             ["ffmpeg", "-y", "-f", "x11grab", "-draw_mouse", "0", "-r", "10", "-i", st["display"],
-             "-vcodec", "libx264", "-preset", "ultrafast", out],
+             "-vcodec", "libx264", "-preset", "ultrafast", tmp_out],
             stdout=subprocess.DEVNULL, stderr=ef)
         script_ok = True
         try:
@@ -239,17 +245,21 @@ def record(
         if script and not script_ok:
             raise SystemExit(f"record aborted: script {script} FAILED, no MP4 verified")
     frames = subprocess.run(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0",
-                             "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", out],
+                             "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", tmp_out],
                             capture_output=True, text=True)
     n = frames.stdout.strip()
     def _fail(msg: str) -> None:
-        Path(out).unlink(missing_ok=True)  # never leave a file we disown
+        try:
+            Path(tmp_out).unlink()  # never leave a file we disown
+            Path(out).unlink()
+        except OSError:
+            pass
         tail = errlog.read_text(errors="replace")[-500:] if errlog.exists() else ""
         raise SystemExit(f"{msg}: {out}\nffmpeg: {tail.strip()[-300:]}")
     if not n or n == "0":
         _fail("record produced no frames")
     # Content gate: pull one frame, refuse flat/black recordings.
-    fr = subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", out,
+    fr = subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", tmp_out,
                            "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"],
                           capture_output=True)
     try:
@@ -260,6 +270,7 @@ def record(
         flat = not fr.stdout
     if flat:
         _fail("record is blank (no pixel variance) — was the app running?")
+    os.replace(tmp_out, out)
     rprint(f"[bold green]saved[/] {out} ({n} frames)")
 
 
@@ -268,9 +279,11 @@ def show(name: str = typer.Option("app", help="Session name")) -> None:
     """Relaunch the same command visibly for the human. Only when READY_FOR_HUMAN."""
     _require_linux("show")
     st = need_session(name)
-    rprint(f"[yellow]Re-launching visibly for YOU to test:[/] {st['cmd']}")
+    if not _cmd(st):
+        raise SystemExit(f"session '{name}' has no command recorded — cannot show")
+    rprint(f"[yellow]Re-launching visibly for YOU to test:[/] {_cmd(st)}")
     rprint("[dim]Headless session keeps running untouched.[/]")
-    subprocess.Popen(st["cmd"], shell=True)
+    subprocess.Popen(_cmd(st), shell=True)
 
 
 @app.command()
@@ -292,7 +305,12 @@ def kill(name: str = typer.Option("app", help="Session name (or --all)"),
          quiet: bool = typer.Option(False, help="No output")) -> None:
     """Kill headless session(s). Verifies cmdline+starttime — never kills strangers."""
     _require_linux("kill")
-    _kill([p.stem for p in SESSIONS.glob("*.json")] if all else [name], sweep, force, quiet)
+    _kill([p.stem for p in sessions_dir().glob("*.json")] if all else [name], sweep, force, quiet)
+
+
+def _cmd(st: dict) -> str:
+    cmd = st.get('cmd', '')
+    return cmd if isinstance(cmd, str) else ''
 
 
 def _app_is_ours(pid: int, st: dict) -> bool:
@@ -304,7 +322,7 @@ def _app_is_ours(pid: int, st: dict) -> bool:
     recorded = st.get("app_starttime", "")
     if recorded:
         return proc_stat_starttime(pid) == recorded
-    cmd = st.get("cmd", "")
+    cmd = _cmd(st)
     return bool(cmd and cmd[:40] in proc_cmdline(pid))
 
 
@@ -318,32 +336,34 @@ def _coerce_pids(st: dict) -> tuple[int | None, int | None]:
     return app, x
 
 
-def _kill(names: list[str], sweep: bool, force: bool, quiet: bool) -> None:
-    from pathlib import Path as _P
+def _kill(names: list[str], sweep: bool, force: bool, quiet: bool) -> list[str]:
+    """Kill sessions. Returns names KEPT because a live process couldn't be verified."""
     from desktop import boot_id as _boot
+    kept: list[str] = []
     for n in names:
         st = load(n)
         if not st:
-            p = _P(session_path(n))
-            if p.exists():
+            pth = Path(session_path(n))
+            if pth.exists():
                 try:
-                    p.unlink()
+                    pth.unlink()
                     if not quiet:
                         rprint(f"[dim]{n}: unreadable session file cleared.[/]")
                 except OSError:
                     pass
             continue
         app_pid, xvfb_pid = _coerce_pids(st)
-        if app_pid is None and (st.get("app") is not None or st.get("xvfb") is not None):
+        if (app_pid is None and xvfb_pid is None
+                and (st.get("app") is not None or st.get("xvfb") is not None)):
+            # Wholly unverifiable: only safe if nothing is alive under those names.
             try:
-                _P(session_path(n)).unlink()
+                Path(session_path(n)).unlink()
                 if not quiet:
                     rprint(f"[dim]{n}: wrong-typed session file cleared.[/]")
             except OSError:
                 pass
             continue
         if st.get("boot_id") not in (None, "", _boot()):
-            # Pre-reboot stale session: PIDs meaningless, drop without signalling.
             if xvfb_pid:
                 verified_kill(xvfb_pid, XVFB_ARGV0, st.get("xvfb_starttime", ""))
             drop_session(n)
@@ -355,27 +375,40 @@ def _kill(names: list[str], sweep: bool, force: bool, quiet: bool) -> None:
             if not quiet:
                 rprint(f"[dim]{n}: force-dropped without signalling (PIDs left alone).[/]")
             continue
+        # D6: handle each pid independently; drop only when nothing alive survives.
+        leftovers: list[str] = []
         if app_pid and proc_cmdline(app_pid):
-            if not _app_is_ours(app_pid, st):
+            if _app_is_ours(app_pid, st):
+                if verified_kill(app_pid, _cmd(st)[:40], st.get("app_starttime", "")):
+                    try:
+                        os.killpg(app_pid, signal.SIGTERM)
+                    except (ProcessLookupError, PermissionError, OSError):
+                        pass
+                if proc_cmdline(app_pid):
+                    leftovers.append(f"app pid={app_pid}")
+            else:
+                leftovers.append(f"unverified app pid={app_pid}")
                 if not quiet:
                     rprint(f"[dim]{n}:app alive but identity unverified (PID reuse?) — session kept. Use --force to drop.[/]")
-                continue
-            if verified_kill(app_pid, (st.get("cmd") or "")[:40], st.get("app_starttime", "")):
-                try:
-                    os.killpg(app_pid, signal.SIGTERM)  # group reap only after verified kill
-                except (ProcessLookupError, PermissionError, OSError):
-                    pass
-        if xvfb_pid:
-            verified_kill(xvfb_pid, XVFB_ARGV0, st.get("xvfb_starttime", ""))
+        if xvfb_pid and proc_cmdline(xvfb_pid):
+            if verified_kill(xvfb_pid, XVFB_ARGV0, st.get("xvfb_starttime", "")):
+                pass
+            if proc_cmdline(xvfb_pid):
+                leftovers.append(f"Xvfb pid={xvfb_pid}")
+        if leftovers:
+            kept.append(n)
+            if not quiet:
+                rprint(f"[dim]{n}: kept ({', '.join(leftovers)} still alive).[/]")
+            continue
         drop_session(n)
     if sweep:
-        for r in SESSIONS.glob(".reserve-*"):
+        for r in sessions_dir().glob(".reserve-*"):
             try:
                 r.unlink()
             except OSError:
                 pass
         claimed: set[int] = set()
-        for q in SESSIONS.glob("*.json"):
+        for q in sessions_dir().glob("*.json"):
             try:
                 st0 = json.loads(q.read_text())
                 a, x = _coerce_pids(st0)
@@ -392,8 +425,9 @@ def _kill(names: list[str], sweep: bool, force: bool, quiet: bool) -> None:
             if verified_kill(pid, XVFB_ARGV0, st_match) and not quiet:
                 rprint(f"[dim]swept orphan boaz Xvfb pid={pid}.[/]")
     if not quiet:
-        live = [p.stem for p in SESSIONS.glob("*.json")]
+        live = [q.stem for q in sessions_dir().glob("*.json")]
         rprint(f"[dim]boaz stopped requested sessions. Still tracked: {', '.join(live) or 'none'}.[/]")
+    return kept
 
 
 def _x11_server_pids() -> list[int]:
@@ -417,7 +451,7 @@ def ps() -> None:
     """List live headless sessions (name, display, pid, cmd)."""
     _require_linux("ps")
     found = False
-    for p in sorted(SESSIONS.glob("*.json")):
+    for p in sorted(sessions_dir().glob("*.json")):
         try:
             st = json.loads(p.read_text())
             if not isinstance(st, dict):

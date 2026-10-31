@@ -23,9 +23,15 @@ import subprocess
 import time
 from pathlib import Path
 
-SESSIONS = Path.home() / ".cache" / "boaz" / "sessions"
-SESSIONS.mkdir(parents=True, exist_ok=True)
-ALLOC_LOCK = Path.home() / ".cache" / "boaz" / ".alloc.lock"
+def sessions_dir() -> Path:
+    """Per-invocation override so parallel agents/CI never share a pool."""
+    d = Path(os.environ.get("BOAZ_SESSION_DIR", str(Path.home() / ".cache" / "boaz" / "sessions")))
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+SESSIONS = sessions_dir()
+ALLOC_LOCK = sessions_dir().parent / ".alloc.lock"
 
 FIRST_DISPLAY = 99
 LAST_DISPLAY = 110
@@ -37,7 +43,7 @@ XVFB_ARGV0 = "boaz-Xvfb"  # ownership marker: sweep only kills OUR servers
 
 def session_path(name: str) -> str:
     safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
-    return str(SESSIONS / f"{safe}.json")
+    return str(sessions_dir() / f"{safe}.json")
 
 
 def load(name: str) -> dict:
@@ -114,8 +120,13 @@ def display_taken(num: int) -> bool:
         pass
     if Path(f"/tmp/.X11-unix/X{num}").exists():
         return True
-    if Path(f"/tmp/.X{num}-lock").exists():
+    try:
+        lock_pid = Path(f"/tmp/.X{num}-lock").read_text().split()[1]
+        if not Path(f"/proc/{lock_pid}").exists():
+            return False  # stale lock from a SIGKILLed server; Xvfb itself ignores it
         return True
+    except (OSError, IndexError):
+        pass
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(0.3)
@@ -129,7 +140,7 @@ def display_taken(num: int) -> bool:
 
 def _prune_reservations() -> None:
     now = time.time()
-    for r in SESSIONS.glob(".reserve-*"):
+    for r in sessions_dir().glob(".reserve-*"):
         try:
             if now - r.stat().st_mtime > 60:
                 r.unlink()
@@ -140,12 +151,12 @@ def _prune_reservations() -> None:
 def claimed_displays() -> set[int]:
     _prune_reservations()
     out: set[int] = set()
-    for r in SESSIONS.glob(".reserve-*"):
+    for r in sessions_dir().glob(".reserve-*"):
         try:
             out.add(int(r.name.split("-")[1]))
         except (IndexError, ValueError):
             pass
-    for p in SESSIONS.glob("*.json"):
+    for p in sessions_dir().glob("*.json"):
         try:
             d = json.loads(p.read_text()).get("display", "")
             if isinstance(d, str) and d.startswith(":") and d[1:].isdigit():
@@ -165,7 +176,7 @@ def alloc_display() -> int:
             claimed = claimed_displays()
             for n in range(FIRST_DISPLAY, LAST_DISPLAY + 1):
                 if n not in claimed and not display_taken(n):
-                    Path(SESSIONS / f".reserve-{n}").touch()
+                    Path(sessions_dir() / f".reserve-{n}").touch()
                     return n
         finally:
             if fcntl is not None:
@@ -180,7 +191,7 @@ def confirm_display(num: int) -> None:
 
 def release_display(num: int) -> None:
     try:
-        Path(SESSIONS / f".reserve-{num}").unlink()
+        Path(sessions_dir() / f".reserve-{num}").unlink()
     except FileNotFoundError:
         pass
 

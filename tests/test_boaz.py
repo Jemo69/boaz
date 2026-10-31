@@ -13,6 +13,9 @@ import uuid
 from pathlib import Path
 
 import pytest
+import tempfile
+from desktop import sessions_dir
+os.environ['BOAZ_SESSION_DIR'] = tempfile.mkdtemp(prefix='boaz-test-')
 
 BOAZ = ["uv", "run", "python", "main.py"]
 REPO = Path(__file__).resolve().parent.parent
@@ -24,7 +27,8 @@ needs_xlogo = pytest.mark.skipif(not XLOGO.exists(), reason="xlogo fixture app m
 
 
 def boaz(*args):
-    return subprocess.run(BOAZ + list(args), cwd=REPO, capture_output=True, text=True)
+    env = dict(os.environ, BOAZ_SESSION_DIR=os.environ['BOAZ_SESSION_DIR'])
+    return subprocess.run(BOAZ + list(args), cwd=REPO, capture_output=True, text=True, env=env)
 
 
 def tag(prefix):
@@ -32,7 +36,7 @@ def tag(prefix):
 
 
 def session(name):
-    p = Path.home() / ".cache" / "boaz" / "sessions" / f"{name}.json"
+    p = sessions_dir() / f"{name}.json"
     try:
         return json.loads(p.read_text())
     except (OSError, ValueError):
@@ -143,7 +147,7 @@ def test_crashed_app_kill_reaps_display(names):
 @needs_linux
 def test_corrupt_session_fails_clean_and_clears(names):
     n = tag("t-corrupt")
-    p = Path.home() / f".cache/boaz/sessions/{n}.json"
+    p = sessions_dir() / f"{n}.json"
     p.write_text('{"cmd": "x"}')
     try:
         r = boaz("screenshot", "--name", n)
@@ -185,7 +189,7 @@ def test_blank_capture_refuses_exit_zero(names):
     n = tag("t-blank"); names.append(n)
     try:
         confirm_display(num)
-        Path.home().joinpath(f".cache/boaz/sessions/{n}.json").write_text(json.dumps(
+        (sessions_dir() / f"{n}.json").write_text(json.dumps(
             {"display": f":{num}", "app": 1, "cmd": "gone", "name": n}))
         r = boaz("screenshot", "--name", n, "--out", f"/tmp/boaz-{n}-blank.png")
         assert r.returncode != 0, "blank capture exited 0: " + r.stdout
@@ -193,7 +197,7 @@ def test_blank_capture_refuses_exit_zero(names):
         assert "blank" in (r.stdout + r.stderr).lower()
         assert not Path(f"/tmp/boaz-{n}-blank.png").exists(), "blank frame must not be left behind"
     finally:
-        Path.home().joinpath(f".cache/boaz/sessions/{n}.json").unlink(missing_ok=True)
+        (sessions_dir() / f"{n}.json").unlink(missing_ok=True)
         xvfb.terminate(); xvfb.wait()
 
 
@@ -232,7 +236,7 @@ def test_sweep_spares_foreign_xvfb():
 @needs_linux
 def test_type_corrupt_session_clears_clean(names):
     n = tag("t-type")
-    p = Path.home() / f".cache/boaz/sessions/{n}.json"
+    p = sessions_dir() / f"{n}.json"
     p.write_text(json.dumps({"display": ":99", "app": "notanint", "xvfb": "alsonotint", "cmd": "x"}))
     try:
         r = boaz("kill", "--name", n)
@@ -267,14 +271,14 @@ def test_record_blank_dead_app_refuses_and_cleans(names):
     out = f"/tmp/boaz-{n}.mp4"
     try:
         confirm_display(num)
-        Path.home().joinpath(f".cache/boaz/sessions/{n}.json").write_text(json.dumps(
+        (sessions_dir() / f"{n}.json").write_text(json.dumps(
             {"display": f":{num}", "app": 1, "cmd": "gone", "name": n}))
         r = boaz("record", "--name", n, "--out", out, "--seconds", "1")
         assert r.returncode != 0, f"black MP4 accepted:\n{r.stdout}"
         assert "blank" in (r.stdout + r.stderr).lower()
         assert not Path(out).exists(), "unverified MP4 must be removed"
     finally:
-        Path.home().joinpath(f".cache/boaz/sessions/{n}.json").unlink(missing_ok=True)
+        (sessions_dir() / f"{n}.json").unlink(missing_ok=True)
         xvfb.terminate(); xvfb.wait()
 
 
