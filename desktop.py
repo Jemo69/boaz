@@ -54,14 +54,22 @@ def session_path(name: str) -> str:
     return str(sessions_dir() / f"{safe}.json")
 
 
+def _read_json(path: Path, limit: int = 1 << 20):
+    """Parse a JSON file, hardened: size cap + RecursionError included.
+    Returns {} on any problem (callers validate shape)."""
+    try:
+        if path.stat().st_size > limit:
+            return {}
+        return json.loads(path.read_text())
+    except (OSError, ValueError, RecursionError):
+        return {}
+
+
 def load(name: str) -> dict:
     """Raw load. Returns {} for missing/unreadable files (kill/ps stay total)."""
     p = Path(session_path(name))
-    try:
-        data = json.loads(p.read_text())
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    data = _read_json(p)
+    return data if isinstance(data, dict) else {}
 
 
 def safe_stem(name: str) -> str:
@@ -74,7 +82,8 @@ def need_session(name: str) -> dict:
     """Validated load for commands that drive the app. Loud, no KeyError ever.
     Also verifies the session's Xvfb is still alive and matches: a stale
     session must never screenshot/drive another pool's display (D1)."""
-    st = load(name)
+    raw = _read_json(Path(session_path(name)))
+    st = raw if isinstance(raw, dict) else {}
     disp = st.get("display")
     app_pid = st.get("app")
     path = session_path(name)
@@ -216,15 +225,12 @@ def claimed_displays() -> set[int]:
         except (IndexError, ValueError):
             pass
     for p in sessions_dir().glob("*.json"):
-        try:
-            data = json.loads(p.read_text())
-            if not isinstance(data, dict):
-                continue
-            d = data.get("display", "")
-            if isinstance(d, str) and d.startswith(":") and d[1:].isdigit():
-                out.add(int(d[1:]))
-        except (OSError, ValueError):
+        data = _read_json(p)
+        if not isinstance(data, dict):
             continue
+        d = data.get("display", "")
+        if isinstance(d, str) and d.startswith(":") and d[1:].isdigit():
+            out.add(int(d[1:]))
     return out
 
 
@@ -423,13 +429,24 @@ def capture(display: str, path: Path, window: str | None = None) -> Path:
     Raises SystemExit (no traceback to agents) with the failing tool's stderr.
     """
     need_bins("ffmpeg")
+    if not path.name or path.is_dir():
+        raise SystemExit(f"cannot write {path}: is a directory")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         raise SystemExit(f"cannot write {path}: {e}")
-    tmp = path.with_name(path.name + ".tmp.png")
-    tmp.unlink(missing_ok=True)  # never promote a stale frame from a killed grab
-    xwd = path.with_name(path.name + ".tmp.xwd")
+    # Per-process tmp names: concurrent grabs of the same output never share a file.
+    tag = f".{os.getpid()}.tmp"
+    tmp = path.with_name(path.name + tag + ".png")
+    xwd = path.with_name(path.name + tag + ".xwd")
+    try:
+        return _capture_inner(display, path, tmp, xwd, window)
+    finally:
+        tmp.unlink(missing_ok=True)
+        xwd.unlink(missing_ok=True)
+
+
+def _capture_inner(display: str, path: Path, tmp: Path, xwd: Path, window: str | None) -> None:
     errs: list[str] = []
 
     def done() -> Path | None:

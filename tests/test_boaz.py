@@ -355,7 +355,8 @@ def test_slash_name_sanitized(names):
     r = boaz("launch", str(XLOGO), "--name", n, "--wait", "15")
     assert r.returncode == 0 and "Traceback" not in r.stdout + r.stderr, r.stdout + r.stderr
     names.append(n)
-    assert (sessions_dir() / "t-slash-*.json").parent is not None
+    assert list(sessions_dir().glob("t_slash-*.json")), "sanitized session file must exist"
+    assert not list(sessions_dir().glob("t/slash-*.json")), "must not create subdirectories"
     r = boaz("screenshot", "--name", n)
     assert r.returncode == 0, r.stdout + r.stderr
     r = boaz("kill", "--name", n)
@@ -427,6 +428,11 @@ def test_stale_lock_does_not_hide_live_display(names):
         srv.bind("\0/tmp/.X11-unix/X%d" % num)
         srv.listen(1)
         assert display_taken(num) is True, "live abstract socket ignored"
+        Path(f"/tmp/.X{num}-lock").write_text("99999999\n")  # stale lock, dead pid
+        try:
+            assert display_taken(num) is True, "stale lock hid a live display"
+        finally:
+            Path(f"/tmp/.X{num}-lock").unlink(missing_ok=True)
     finally:
         srv.close()
         release_display(num)
@@ -458,3 +464,48 @@ def test_stale_session_refuses_to_drive_foreign_display(names):
             xvfb.terminate(); xvfb.wait()
         except Exception:
             pass
+
+
+@needs_linux
+def test_logs_are_pool_scoped(names):
+    """Two pools launching the same --name must not share log files."""
+    import tempfile
+    pool_b = tempfile.mkdtemp(prefix="boaz-logpool-")
+    n = tag("t-log"); names.append(n)
+    r = boaz("launch", "echo POOL_A_MARKER; sleep 30", "--name", n, "--wait", "5")
+    assert r.returncode in (0, 2), r.stdout + r.stderr
+    try:
+        r = boaz("log", "--name", n)
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "POOL_A_MARKER" in r.stdout, f"wrong pool's log:\n{r.stdout}"
+        env_b = dict(os.environ, BOAZ_SESSION_DIR=pool_b)
+        rb = subprocess.run(BOAZ + ["log", "--name", n], cwd=REPO,
+                            capture_output=True, text=True, env=env_b)
+        assert rb.returncode != 0, "pool B must not read pool A's log"
+    finally:
+        shutil.rmtree(pool_b, ignore_errors=True)
+
+
+@needs_linux
+@needs_xlogo
+def test_record_keeps_user_file_on_valid_session_blank(names):
+    """Same as keep-file, but through the real blank gate (valid session, empty display)."""
+    from desktop import alloc_display, confirm_display
+    num = alloc_display()
+    xvfb = subprocess.Popen(["boaz-Xvfb", f":{num}", "-screen", "0", "800x600x24"],
+                            executable=str(Path.home() / ".local" / "bin" / "Xvfb"),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(1.0)
+    n = tag("t-keep2"); names.append(n)
+    keep = Path(f"/tmp/boaz-keep2-{uuid.uuid4().hex[:6]}.mp4")
+    keep.write_bytes(b"precious-user-bytes")
+    try:
+        confirm_display(num)
+        _live_session(n, num, xvfb)
+        r = boaz("record", "--name", n, "--out", str(keep), "--seconds", "1")
+        assert r.returncode != 0, f"black MP4 accepted:\n{r.stdout}"
+        assert keep.read_bytes() == b"precious-user-bytes"
+    finally:
+        (sessions_dir() / f"{n}.json").unlink(missing_ok=True)
+        xvfb.terminate(); xvfb.wait()
+        keep.unlink(missing_ok=True)

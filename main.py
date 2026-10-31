@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import typer
@@ -23,7 +24,7 @@ from rich import print as rprint
 from desktop import (
     FIRST_DISPLAY, HEIGHT, LAST_DISPLAY, WIDTH, XVFB_ARGV0,
     alloc_display, capture, confirm_display, display_env, display_taken, drop_session, load,
-    need_session, proc_cmdline, proc_environ, proc_stat_starttime, release_display, safe_stem, save, session_path, sessions_dir, verified_kill,
+    need_session, proc_cmdline, proc_environ, proc_stat_starttime, release_display, safe_stem, save, session_path, sessions_dir, verified_kill, _read_json,
     wait_for_window, need_bins, xvfb_bin, GLOBAL_RESERVE,
 )
 
@@ -110,7 +111,7 @@ def launch(
         release_display(num)
         raise
     confirm_display(num)
-    log = Path(f"/tmp/boaz-{safe_stem(name)}.log")
+    log = sessions_dir() / f"{safe_stem(name)}.log"
     try:
         lf = log.open("wb")
     except OSError as e:
@@ -122,13 +123,15 @@ def launch(
         raise SystemExit(f"cannot open log {log}: {e}")
     try:
         with lf:
-            proc = subprocess.Popen(cmd, shell=True, env=display_env(display),
+            app_token = uuid.uuid4().hex
+            app_env = dict(display_env(display), BOAZ_APP_TOKEN=app_token)
+            proc = subprocess.Popen(cmd, shell=True, env=app_env,
                                     stdout=lf, stderr=subprocess.STDOUT,
                                     start_new_session=True)  # own process group: kill takes children too
         from desktop import boot_id as _boot
         save(name, {"xvfb": xvfb.pid, "xvfb_starttime": proc_stat_starttime(xvfb.pid),
                     "app": proc.pid, "app_starttime": proc_stat_starttime(proc.pid),
-                    "boot_id": _boot(),
+                    "boot_id": _boot(), "app_token": app_token,
                     "cmd": cmd, "display": display, "name": name})
     except BaseException:
         try:
@@ -188,10 +191,13 @@ def _run(script: str, name: str) -> bool:
     need_bins("xdotool")
     st = need_session(name)
     try:
-        steps = json.loads(Path(script).read_text())
+        raw = Path(script).read_bytes()
+        if len(raw) > (1 << 20):
+            raise SystemExit(f"bad script {script}: file too large (>1MB)")
+        steps = json.loads(raw.decode(errors="replace"))
     except OSError as e:
         raise SystemExit(f"bad script {script}: {e}")
-    except ValueError as e:
+    except (ValueError, RecursionError) as e:
         raise SystemExit(f"bad script {script}: invalid JSON: {e}")
     if not isinstance(steps, list):
         raise SystemExit(f"bad script {script}: top level must be a JSON list of steps")
@@ -282,7 +288,7 @@ def record(
         pass
     except OSError as e:
         raise SystemExit(f"cannot write {tmp_out}: {e}")
-    errlog = Path(f"/tmp/boaz-{safe_stem(name)}-ff.log")
+    errlog = sessions_dir() / f"{safe_stem(name)}-ff.log"
     try:
         ef = errlog.open("wb")
     except OSError as e:
@@ -335,19 +341,31 @@ def record(
         raise SystemExit(f"{msg}: {out}\nffmpeg: {tail.strip()[-300:]}")
     if not n or n == "0":
         _fail("record produced no frames")
-    # Content gate: pull one frame, refuse flat/black recordings.
+    # Content gate: sample first/middle/last frames, refuse flat/black recordings.
     try:
-        fr = subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", tmp_out,
-                               "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"],
-                              capture_output=True, timeout=15)
-    except subprocess.TimeoutExpired:
-        fr = subprocess.CompletedProcess([], 124, b"", "frame extract timed out")
-    try:
-        from PIL import Image, ImageStat
-        import io as _io
-        flat = (ImageStat.Stat(Image.open(_io.BytesIO(fr.stdout)).convert("L")).stddev[0] or 0) < 1.5
-    except Exception:
-        flat = not fr.stdout
+        dur = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                                "format=duration", "-of", "csv=p=0", tmp_out],
+                               capture_output=True, text=True, timeout=15)
+        total = max(float((dur.stdout or "0").strip() or 0), 0.1)
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        total = 0.1
+    flat = True
+    for pos in (0.0, total / 2, max(total - 0.2, 0.0)):
+        try:
+            fr = subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", str(round(pos, 2)),
+                                   "-i", tmp_out, "-frames:v", "1", "-f", "image2pipe",
+                                   "-vcodec", "png", "-"],
+                                  capture_output=True, timeout=15)
+        except subprocess.TimeoutExpired:
+            continue
+        try:
+            from PIL import Image, ImageStat
+            import io as _io
+            if (ImageStat.Stat(Image.open(_io.BytesIO(fr.stdout)).convert("L").resize((160, 100))).stddev[0] or 0) > 1.5:
+                flat = False
+                break
+        except Exception:
+            continue
     if flat:
         _fail("record is blank (no pixel variance) — was the app running?")
     os.replace(tmp_out, out)
@@ -376,7 +394,7 @@ def log(name: str = typer.Option("app", help="Session name"),
         lines: int = typer.Option(30, help="Tail lines")) -> None:
     """Show the headless app's stdout/stderr (why no window yet?)."""
     _require_linux("log")
-    p = Path(f"/tmp/boaz-{safe_stem(name)}.log")
+    p = sessions_dir() / f"{safe_stem(name)}.log"
     if not p.is_file():
         raise SystemExit(f"No log for '{name}'.")
     try:
@@ -486,11 +504,22 @@ def _kill(names: list[str], sweep: bool, force: bool, quiet: bool) -> list[str]:
                 if not quiet:
                     rprint(f"[dim]{n}:app alive but identity unverified (PID reuse?) — session kept. Use --force to drop.[/]")
         elif app_pid:
-            # Leader already dead (crashed/exited): reap surviving group members.
-            from desktop import kill_group as _kg, pids_in_group as _pig
-            if _pig(app_pid):
+            # Leader already dead (crashed/exited): reap surviving group members
+            # ONLY with proof of ownership — a recorded token present in a
+            # member's environ, plus a recorded starttime. Otherwise a recycled
+            # pgid could belong to strangers: keep the session and exit 3.
+            from desktop import kill_group as _kg, pids_in_group as _pig, proc_environ as _penv
+            members = _pig(app_pid)
+            token = st.get("app_token", "")
+            owned = [m for m in members
+                     if token and _penv(m).get("BOAZ_APP_TOKEN") == token]
+            if members and owned and st.get("app_starttime"):
                 for survivor in _kg(app_pid):
                     leftovers.append(f"orphaned group member pid={survivor}")
+            elif members:
+                leftovers.append(f"unverified group pgid={app_pid} ({len(members)} members) kept")
+                if not quiet:
+                    rprint(f"[dim]{n}:group identity unverified — session kept. Use --force to drop.[/]")
         if xvfb_pid and proc_cmdline(xvfb_pid):
             if verified_kill(xvfb_pid, XVFB_ARGV0, st.get("xvfb_starttime", "")):
                 pass
@@ -524,7 +553,7 @@ def _kill(names: list[str], sweep: bool, force: bool, quiet: bool) -> list[str]:
         claimed: set[int] = set()
         for q in sessions_dir().glob("*.json"):
             try:
-                st0 = json.loads(q.read_text())
+                st0 = _read_json(q)
                 if not isinstance(st0, dict):
                     continue
                 a, x = _coerce_pids(st0)
@@ -532,7 +561,7 @@ def _kill(names: list[str], sweep: bool, force: bool, quiet: bool) -> list[str]:
                     claimed.add(a)
                 if x:
                     claimed.add(x)
-            except (ValueError, OSError):
+            except (ValueError, OSError, RecursionError):
                 continue
         for pid in _x11_server_pids():
             if pid in claimed:
@@ -578,7 +607,7 @@ def ps() -> None:
             st = json.loads(p.read_text())
             if not isinstance(st, dict):
                 raise ValueError("not a dict")
-        except (ValueError, OSError):
+        except (ValueError, OSError, RecursionError):
             rprint(f"[dim]⚠ {p.stem}: unreadable session file — `boaz kill --name {p.stem}` to clear.[/]")
             continue
         app_pid, _x = _coerce_pids(st)
