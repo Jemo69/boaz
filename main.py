@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import platform
 import shutil
 import signal
@@ -298,6 +299,12 @@ def record(
             else:
                 time.sleep(seconds)
                 rprint(f"[dim]static capture {seconds}s[/]")
+        except BaseException:
+            try:
+                Path(tmp_out).unlink()
+            except OSError:
+                pass
+            raise
         finally:
             ff.terminate()
             try:
@@ -351,9 +358,14 @@ def record(
 def show(name: str = typer.Option("app", help="Session name")) -> None:
     """Relaunch the same command visibly for the human. Only when READY_FOR_HUMAN."""
     _require_linux("show")
-    st = need_session(name)
-    if not _cmd(st):
+    st = load(name)
+    if not st or not _cmd(st):
         raise SystemExit(f"session '{name}' has no command recorded — cannot show")
+    human = os.environ.get("DISPLAY", "")
+    if not human or human == st.get("display") or re.match(r":(99|10[0-9]|110)$", human):
+        raise SystemExit(
+            f"refusing show: DISPLAY={human!r} is empty or headless. "
+            "Run `boaz show` from your visible desktop session.")
     rprint(f"[yellow]Re-launching visibly for YOU to test:[/] {_cmd(st)}")
     rprint("[dim]Headless session keeps running untouched.[/]")
     subprocess.Popen(_cmd(st), shell=True)

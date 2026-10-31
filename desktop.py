@@ -71,21 +71,34 @@ def safe_stem(name: str) -> str:
 
 
 def need_session(name: str) -> dict:
-    """Validated load for commands that drive the app. Loud, no KeyError ever."""
+    """Validated load for commands that drive the app. Loud, no KeyError ever.
+    Also verifies the session's Xvfb is still alive and matches: a stale
+    session must never screenshot/drive another pool's display (D1)."""
     st = load(name)
     disp = st.get("display")
     app_pid = st.get("app")
+    path = session_path(name)
     in_range = (isinstance(disp, str) and disp.startswith(":") and disp[1:].isdigit()
                 and FIRST_DISPLAY <= int(disp[1:]) <= LAST_DISPLAY)
-    if (not in_range
-            or not isinstance(app_pid, int) or isinstance(app_pid, bool) or app_pid <= 0):
-        path = session_path(name)
-        if Path(path).exists():
-            raise SystemExit(
-                f"corrupt session file for '{name}' (needs display + app pid). "
-                f"`boaz kill --name {name}` clears it.")
-        raise SystemExit("No session '%s'. Run: boaz launch --name %s '<cmd>' first." % (name, name))
-    return st
+    valid_shape = (in_range and isinstance(app_pid, int)
+                   and not isinstance(app_pid, bool) and app_pid > 0)
+    if valid_shape:
+        xvfb = st.get("xvfb")
+        alive = (isinstance(xvfb, int) and not isinstance(xvfb, bool)
+                 and XVFB_ARGV0 in proc_cmdline(xvfb)
+                 and (not st.get("xvfb_starttime")
+                      or proc_stat_starttime(xvfb) == st.get("xvfb_starttime"))
+                 and st.get("boot_id") in (None, "", boot_id()))
+        if alive:
+            return st
+        raise SystemExit(
+            f"session '{name}' is stale: its Xvfb {xvfb} is gone/recycled. "
+            f"`boaz kill --name {name}` and launch again.")
+    if Path(path).exists():
+        raise SystemExit(
+            f"corrupt session file for '{name}' (needs display + app pid). "
+            f"`boaz kill --name {name}` clears it.")
+    raise SystemExit("No session '%s'. Run: boaz launch --name %s '<cmd>' first." % (name, name))
 
 
 def save(name: str, data: dict) -> None:
@@ -255,6 +268,11 @@ def release_display(num: int) -> None:
 def display_env(display: str) -> dict[str, str]:
     e = dict(os.environ)
     e["DISPLAY"] = display
+    # Wayland escape hatch: Wayland-first toolkits (Electron/GTK/Qt/GPUI)
+    # prefer WAYLAND_DISPLAY over DISPLAY and would pop onto the HUMAN's
+    # compositor. D-Bus activation could even raise a visible instance.
+    e.pop("WAYLAND_DISPLAY", None)
+    e.pop("WAYLAND_SOCKET", None)
     e.setdefault("LIBGL_ALWAYS_SOFTWARE", "1")
     lvp = "/usr/share/vulkan/icd.d/lvp_icd.json"
     if Path(lvp).exists():

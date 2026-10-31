@@ -309,6 +309,7 @@ def test_bad_geometry_fails_fast_and_releases(names):
     before = set(GLOBAL_RESERVE.glob("*")) if GLOBAL_RESERVE.exists() else set()
     r = boaz("launch", "sleep 30", "--name", n, "--width", "0", "--wait", "5")
     assert r.returncode != 0 and "320" in (r.stdout + r.stderr)
+    assert session(n) == {}, "no session may be created on validation failure"
     leaked = set(GLOBAL_RESERVE.glob("*")) - before if GLOBAL_RESERVE.exists() else set()
     assert not leaked, f"reservation leaked: {[p.name for p in leaked]}"
 
@@ -325,17 +326,13 @@ def test_kill_refused_exit_code_and_force(names):
              "cmd": "sleep 120", "name": n}))
         r = boaz("kill", "--name", n)
         assert r.returncode == 3, r.stdout + r.stderr
-        assert (_sd_dir() / f"{n}.json").exists() if False else (sessions_dir() / f"{n}.json").exists()
+        assert (sessions_dir() / f"{n}.json").exists()
         r = boaz("kill", "--name", n, "--force")
         assert r.returncode == 0
         assert not (sessions_dir() / f"{n}.json").exists()
         assert p.poll() is None, "force must not signal"
     finally:
         p.kill(); p.wait()
-
-
-def _sd_dir():
-    return sessions_dir()
 
 
 @needs_linux
@@ -420,3 +417,31 @@ def test_stale_lock_does_not_hide_live_display(names):
     finally:
         srv.close()
         release_display(num)
+
+
+@needs_linux
+def test_stale_session_refuses_to_drive_foreign_display(names):
+    """Killed Xvfb + surviving session file: screenshot must refuse, not drive whoever took the display."""
+    from desktop import alloc_display, confirm_display
+    num = alloc_display()
+    xvfb = subprocess.Popen([str(Path.home() / ".local" / "bin" / "Xvfb"),
+                               f":{num}", "-screen", "0", "800x600x24"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(1.0)
+    n = tag("t-stale"); names.append(n)
+    try:
+        confirm_display(num)
+        (sessions_dir() / f"{n}.json").write_text(json.dumps(
+            {"display": f":{num}", "app": 1, "cmd": "gone", "name": n,
+             "xvfb": xvfb.pid, "boot_id": "stale-test"}))
+        xvfb.terminate(); xvfb.wait()
+        time.sleep(0.5)
+        r = boaz("screenshot", "--name", n, "--out", f"/tmp/boaz-{n}-stale.png")
+        assert r.returncode != 0, f"drove a dead session's display:\n{r.stdout}"
+        assert "stale" in (r.stdout + r.stderr).lower()
+    finally:
+        (sessions_dir() / f"{n}.json").unlink(missing_ok=True)
+        try:
+            xvfb.terminate(); xvfb.wait()
+        except Exception:
+            pass
