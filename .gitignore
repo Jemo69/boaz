@@ -3,3 +3,5 @@ shots/*.mp4
 /tmp/
 __pycache__/
 .pytest_cache/
+evidence/
+shots/
