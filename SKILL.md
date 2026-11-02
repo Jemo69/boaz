@@ -14,27 +14,45 @@ Mishpat owns the browser; boaz owns the desktop. Never confuse them.
 
 ## 1 - Orient
 
-Confirm the CLI answers: `boaz --help`. Commands: `launch`, `screenshot`,
-`run`, `record`, `show`, `log`, `kill`, `ps`, `doctor`.
+Confirm the CLI answers: `boaz --help`. Commands: `launch`, `wait`,
+`screenshot`, `run`, `record`, `show`, `log`, `kill`, `ps`, `doctor`.
 
 Run `boaz doctor` first — it reports exactly what this machine can do
 (Xvfb/xdotool/ffmpeg/scrot/GPU/Lavapipe) and the install for each gap.
 
-Done when: help lists all nine commands and doctor is green on Linux+Xvfb.
+Done when: help lists all ten commands and doctor is green on Linux+Xvfb.
 
 ## 2 - Headless test loop (default)
 
 ```bash
-boaz launch "<cmd>" --name app          # polls for a mapped window (no blind sleep)
+boaz launch "<cmd>" --name app          # runs in YOUR $PWD; --cwd overrides. Echoes cwd= in the launch line.
+boaz launch "<cmd>" --name slow --timeout 120 --cwd /path/to/repo   # slow cold-starts
+boaz wait --name slow --for mapped --timeout 120    # or --for painted (mapped + non-blank frame)
 boaz screenshot --name app             # -> shots/app-NNN.png, open it to SEE
-boaz run tests/flow.json --name app    # [{"action":"wait"|"key"|"type"|"click"|"screenshot", ...}]
+boaz run tests/flow.json --name app    # [{"action":"wait"|"key"|"type"|"click"|"scroll"|"drag"|"screenshot", ...}]
 boaz record --name app --out shots/t.mp4 [--script tests/flow.json]
-boaz log --name app                    # app stdout when no window maps
+boaz log --name app                    # app stdout; "No log" names the dir it searched
 ```
 
+`launch` polls for a mapped window (no blind sleep); on timeout it exits 2,
+prints the window diagnostic line and suggests `boaz wait`. The launch line
+shows `session= display= pid= window= cwd=` plus the shot and log paths.
+
+`run` coordinates are **root-display coordinates as seen in screenshots**
+(the window sits at +0+20 under root). Scroll nested panes with
+`{"action":"scroll","x":640,"y":400,"clicks":3,"dir":"down"}` (dir up|down,
+wheel buttons 4/5) — never click scrollbar tracks to page. Drag with
+`{"action":"drag","x1":100,"y1":200,"x2":300,"y2":400}`.
 Every step auto-screenshots to `shots/`. `run` prints PASS/FAIL and exits
-0/1 — a FAIL names the step index and reason, never a stack trace.
+0/1 — a FAIL names the step index, the specific cause, and one correct
+example for that action, never a stack trace.
 `record` verifies frame count with ffprobe and refuses empty MP4s.
+
+Blank captures refuse with exit non-zero (no black PNG written) and report
+what boaz sees: `window 0x20000b "Title" 1280x760 IsUnMapped` (id, title,
+geometry, map state), plus a toolkit hint when matched (Electron →
+`--disable-gpu`, Java → `-Dsun.java2d.xrender=false`, Qt →
+`QT_QPA_PLATFORM=xcb` / `QT_XCB_FORCE_SOFTWARE_OPENGL=1`).
 
 Done when: every claim about the app is backed by a fresh screenshot or
 `run` PASS, and `ps` shows the session isolated on its own DISPLAY.
@@ -52,10 +70,12 @@ Done when: the MP4 exists, plays, and the human confirms on the visible copy.
 
 ## 4 - Hygiene (parallel-agent safe)
 
-Sessions are per-`--name` (own DISPLAY + state file). `kill` verifies
-`/proc` cmdlines before signalling — it would rather leave a process than
-kill a stranger. `kill --all --sweep` reaps orphans. Never `kill -9` by hand;
-never bind `:99` yourself.
+Sessions live in `~/.cache/boaz/sessions` unless `BOAZ_SESSION_DIR` overrides
+(no export needed in the common case). Each `--name` owns a DISPLAY + state
+file. `ps` hides dead sessions by default (`ps --all` reveals them).
+`kill` verifies `/proc` cmdlines before signalling — it would rather leave a
+process than kill a stranger. `kill --all --sweep` reaps orphans. Never
+`kill -9` by hand; never bind `:99` yourself.
 
 `kill` verifies cmdline AND starttime before signalling and keeps — never
 deletes — a session it refused to kill. `kill --all --sweep` reaps only

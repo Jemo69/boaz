@@ -387,6 +387,19 @@ def kill_group(pgid: int) -> list[int]:
     return left
 
 
+def window_state(display: str) -> tuple[str | None, str]:
+    """First mapped client window id, plus the diagnostic line. Shared by launch/wait."""
+    env = display_env(display)
+    r = _cap_run(["xdotool", "search", "--onlyvisible", ".*"],
+                 env=env, capture_output=True, text=True)
+    for wid in r.stdout.split():
+        q = _cap_run(["xwininfo", "-id", wid], env=env,
+                     capture_output=True, text=True)
+        if "Map State: IsViewable" in q.stdout and "root window" not in q.stdout:
+            return wid, _win_diag(display)
+    return None, _win_diag(display)
+
+
 def wait_for_window(display: str, timeout: float = 30.0) -> str:
     """Poll until a non-root client window maps. Replaces the old blind sleep."""
     need_bins("xdotool", "xwininfo")
@@ -402,6 +415,61 @@ def wait_for_window(display: str, timeout: float = 30.0) -> str:
                 return wid
         time.sleep(0.5)
     raise SystemExit(f"No window mapped on {display} after {timeout}s. See `boaz log`.")
+
+
+def _win_diag(display: str) -> str:
+    """One-line window state for blank-capture errors: id, title, map state, geometry."""
+    env = display_env(display)
+    try:
+        r = subprocess.run(["xdotool", "search", "--name", ".*"],
+                             env=env, capture_output=True, text=True, timeout=5)
+        ids = r.stdout.split()
+    except Exception:
+        return "no window ids found"
+    if not ids:
+        return "no client windows exist"
+    parts: list[str] = []
+    for wid in ids[:4]:
+        try:
+            q = subprocess.run(["xwininfo", "-id", wid], env=env,
+                               capture_output=True, text=True, timeout=5).stdout
+            title = next((l.split(":", 1)[1].strip().strip('"') for l in q.splitlines()
+                            if 'Window id:' in l and '"' in l), "")
+            ms = next((l.split(":", 1)[1].strip() for l in q.splitlines()
+                         if "Map State:" in l), "?")
+            geo = ""
+            w = h = ""
+            for l in q.splitlines():
+                s = l.strip()
+                if s.startswith("Width:"):
+                    w = s.split(":", 1)[1].strip()
+                elif s.startswith("Height:"):
+                    h = s.split(":", 1)[1].strip()
+            if w and h:
+                geo = f" {w}x{h}"
+            parts.append(f'window {wid} "{title}"{geo} {ms}')
+        except Exception:
+            parts.append(f"window {wid} (unreadable)")
+    return "; ".join(parts)
+
+
+def _toolkit_hint(display: str) -> str:
+    """Suggest known flags when a blank screen matches a known toolkit."""
+    for p in Path("/proc").glob("[0-9]*"):
+        try:
+            cmd = (p / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").lower()
+            env_raw = (p / "environ").read_bytes()
+        except OSError:
+            continue
+        if display.encode() not in env_raw:
+            continue
+        if "electron" in cmd:
+            return " Electron under Xvfb usually paints nothing without --disable-gpu — try adding it to your launch command."
+        if "java" in cmd:
+            return " Java apps under Xvfb may need -Dsun.java2d.xrender=false — try adding it."
+        if "qt" in cmd or "qpa" in cmd:
+            return " Qt apps under Xvfb may need QT_QPA_PLATFORM=xcb and QT_XCB_FORCE_SOFTWARE_OPENGL=1."
+    return ""
 
 
 def _variance_ok(path: Path) -> bool:
@@ -457,7 +525,7 @@ def _capture_inner(display: str, path: Path, tmp: Path, xwd: Path, window: str |
 
     def blank() -> SystemExit:
         tmp.unlink(missing_ok=True)
-        return SystemExit(f"capture on {display} is blank (no pixel variance) — is the app still running?")
+        return SystemExit(f"capture on {display} is blank (no pixel variance) — is the app still running?\n{_win_diag(display)}.{_toolkit_hint(display)}")
 
     if window:
         need_bins("xwd", "convert")

@@ -71,13 +71,22 @@ def _shot(name: str, out: str | None = None) -> str:
 def launch(
     cmd: str = typer.Argument(..., help="App command, e.g. './my-electron --no-sandbox'"),
     name: str = typer.Option("app", help="Session name. NOTE: relaunching a name kills its old session first."),
-    wait: float = typer.Option(30.0, help="Seconds to wait for a mapped window"),
+    wait: float = typer.Option(30.0, help="Seconds to wait for a mapped window (alias: --timeout)"),
+    timeout: float = typer.Option(None, help="Same as --wait. Overrides --wait when given."),
+    cwd: str = typer.Option(None, help="Working dir for the app (default: your current $PWD)"),
     width: int = typer.Option(WIDTH, help="Headless screen width"),
     height: int = typer.Option(HEIGHT, help="Headless screen height"),
 ) -> None:
     """Launch an app headless on its own DISPLAY. Never touches your :0."""
     _require_linux("launch")
     need_bins("xdotool")
+    if timeout is not None:
+        wait = timeout
+    if wait <= 0 or wait > 3600:
+        raise SystemExit(f"bad --timeout={wait}: want 0-3600 seconds")
+    run_cwd = str(Path(cwd).expanduser().resolve()) if cwd else os.getcwd()
+    if not Path(run_cwd).is_dir():
+        raise SystemExit(f"bad --cwd={run_cwd}: not a directory")
     for dim, val in (("width", width), ("height", height)):
         if not 320 <= val <= 7680:
             raise SystemExit(f"bad {dim}={val}: want 320-7680 (a real screen size)")
@@ -125,14 +134,14 @@ def launch(
         with lf:
             app_token = uuid.uuid4().hex
             app_env = dict(display_env(display), BOAZ_APP_TOKEN=app_token)
-            proc = subprocess.Popen(cmd, shell=True, env=app_env,
+            proc = subprocess.Popen(cmd, shell=True, env=app_env, cwd=run_cwd,
                                     stdout=lf, stderr=subprocess.STDOUT,
                                     start_new_session=True)  # own process group: kill takes children too
         from desktop import boot_id as _boot
         save(name, {"xvfb": xvfb.pid, "xvfb_starttime": proc_stat_starttime(xvfb.pid),
                     "app": proc.pid, "app_starttime": proc_stat_starttime(proc.pid),
                     "boot_id": _boot(), "app_token": app_token,
-                    "cmd": cmd, "display": display, "name": name})
+                    "cmd": cmd, "display": display, "name": name, "cwd": run_cwd})
     except BaseException:
         try:
             xvfb.kill()
@@ -142,14 +151,54 @@ def launch(
         raise
     try:
         wid = wait_for_window(display, timeout=wait)
-    except SystemExit as e:
-        rprint(f"[yellow]launched but no window yet:[/] {e}")
+    except SystemExit:
+        from desktop import window_state as _ws
+        rprint(f"[yellow]launched in {run_cwd} but no window mapped after {wait}s on {display}.[/]")
+        rprint(f"[dim]{_ws(display)[1]}[/]")
+        rprint(f"[dim]See `boaz log --name {name}`. App still starting? `boaz wait --name {name} --timeout 120`[/]")
         raise typer.Exit(2)
     if xvfb.poll() is not None:
         raise SystemExit(f"Xvfb died under session '{name}'.")
     shot = _shot(name)
-    rprint(f"[bold green]Boaz running headless[/] session={name} display={display} pid={proc.pid} window={wid}")
+    rprint(f"[bold green]Boaz running headless[/] session={name} display={display} pid={proc.pid} window={wid} cwd={run_cwd}")
     rprint(f"[dim]You see nothing. Agent reads: {shot}  Log: {log}[/]")
+
+
+@app.command()
+def wait(
+    name: str = typer.Option("app", help="Session name"),
+    for_: str = typer.Option("mapped", "--for", help="Condition: mapped|painted"),
+    timeout: float = typer.Option(120.0, help="Max seconds to wait"),
+) -> None:
+    """Block until a window maps (or paints), for slow cold-starts. Exits 0/2."""
+    _require_linux("wait")
+    if for_ not in ("mapped", "painted"):
+        raise SystemExit(f"bad --for={for_!r}: want mapped|painted")
+    if not 0 < timeout <= 3600:
+        raise SystemExit(f"bad --timeout={timeout}: want 0-3600")
+    st = need_session(name)
+    from desktop import window_state as _ws
+    if for_ == "mapped":
+        try:
+            wid = wait_for_window(st["display"], timeout=timeout)
+        except SystemExit:
+            rprint(f"[yellow]no window mapped on {st['display']} after {timeout}s. {_ws(st['display'])[1]}[/]")
+            raise typer.Exit(2)
+        rprint(f"[bold green]mapped[/] window={wid} display={st['display']}")
+        return
+    # painted: mapped AND a non-blank capture succeeds
+    deadline = time.time() + timeout
+    last = ""
+    while time.time() < deadline:
+        try:
+            shot = _shot(name)
+            rprint(f"[bold green]painted[/] {shot}")
+            return
+        except SystemExit as e:
+            last = str(e)
+        time.sleep(2.0)
+    rprint(f"[yellow]no painted frame on {st['display']} after {timeout}s. {last}[/]")
+    raise typer.Exit(2)
 
 
 @app.command()
@@ -181,12 +230,16 @@ def run(
     script: str = typer.Argument(..., help="JSON steps file, e.g. tests/flow.json"),
     name: str = typer.Option("app", help="Session name"),
 ) -> None:
-    """Drive the headless app (xdotool) + screenshot every step. Prints PASS/FAIL."""
+    """Drive the headless app (xdotool) + screenshot every step. Prints PASS/FAIL.
+
+    x,y are root-display coordinates as seen in screenshots (window sits at +0+20 under root).
+    """
     ok = _run(script, name)
     raise typer.Exit(0 if ok else 1)
 
 
 def _run(script: str, name: str) -> bool:
+    _EXAMPLES = {"wait": '{"action":"wait","seconds":2}', "key": '{"action":"key","keys":"Escape"}', "type": '{"action":"type","text":"hi"}', "click": '{"action":"click","x":640,"y":400}', "scroll": '{"action":"scroll","x":640,"y":400,"clicks":3,"dir":"down"}', "drag": '{"action":"drag","x1":100,"y1":200,"x2":300,"y2":400}', "screenshot": '{"action":"screenshot"}'}
     _require_linux("run")
     need_bins("xdotool")
     st = need_session(name)
@@ -230,13 +283,40 @@ def _run(script: str, name: str) -> bool:
                     raise ValueError(f"click needs integer x/y, got {s.get('x')!r},{s.get('y')!r}")
                 subprocess.run(["xdotool", "mousemove", str(cx), str(cy), "click", "1"],
                                env=env, check=True, timeout=10)
+            elif a == "scroll":
+                try:
+                    cx, cy = int(s["x"]), int(s["y"])
+                except (TypeError, ValueError):
+                    raise ValueError(f"scroll needs integer x/y, got {s.get('x')!r},{s.get('y')!r}")
+                clicks = s.get("clicks", 3)
+                try:
+                    clicks = int(clicks)
+                except (TypeError, ValueError):
+                    raise ValueError(f"scroll needs integer clicks, got {s.get('clicks')!r}")
+                if not 1 <= clicks <= 50:
+                    raise ValueError(f"scroll needs clicks 1-50, got {clicks}")
+                direction = str(s.get("dir", "down")).lower()
+                if direction not in ("up", "down"):
+                    raise ValueError(f"scroll needs dir up|down, got {s.get('dir')!r}")
+                btn = "4" if direction == "up" else "5"
+                subprocess.run(["xdotool", "mousemove", str(cx), str(cy)] + ["click", btn] * clicks,
+                               env=env, check=True, timeout=10)
+            elif a == "drag":
+                try:
+                    x1, y1, x2, y2 = int(s["x1"]), int(s["y1"]), int(s["x2"]), int(s["y2"])
+                except (TypeError, ValueError):
+                    raise ValueError(f"drag needs ints x1/y1/x2/y2, got {s.get('x1')!r},{s.get('y1')!r},{s.get('x2')!r},{s.get('y2')!r}")
+                subprocess.run(["xdotool", "mousemove", str(x1), str(y1), "mousedown", "1",
+                                "mousemove", str(x2), str(y2), "mouseup", "1"],
+                               env=env, check=True, timeout=10)
             elif a == "screenshot":
                 pass  # every step screenshots anyway
             else:
-                raise ValueError(f"unknown action {a!r} (want wait|key|type|click|screenshot)")
+                raise ValueError(f"unknown action {a!r} (want wait|key|type|click|scroll|drag|screenshot). Example: { _EXAMPLES.get(a) if isinstance(a, str) and a in _EXAMPLES else _EXAMPLES['click'] }")
             rprint(f"  [{i}] {a} ok")
         except (KeyError, TypeError, ValueError) as e:
-            rprint(f"[bold red]  [{i}] {a} FAIL: step needs keys {{action,seconds|keys|text|x,y}}: {e}[/]")
+            ex = _EXAMPLES.get(a, _EXAMPLES["wait"]) if isinstance(a, str) else _EXAMPLES["wait"]
+            rprint(f"[bold red]  [{i}] {a} FAIL: {e}. Example: {ex}[/]")
             ok = False
             break
         except subprocess.CalledProcessError as e:
@@ -396,7 +476,7 @@ def log(name: str = typer.Option("app", help="Session name"),
     _require_linux("log")
     p = sessions_dir() / f"{safe_stem(name)}.log"
     if not p.is_file():
-        raise SystemExit(f"No log for '{name}'.")
+        raise SystemExit(f"No log for '{name}' (searched {sessions_dir()}). Launch first: boaz launch --name {name} '<cmd>'")
     try:
         text = p.read_text(errors="replace")
     except OSError as e:
@@ -598,7 +678,7 @@ def _x11_server_pids() -> list[int]:
 
 
 @app.command()
-def ps() -> None:
+def ps(all: bool = typer.Option(False, help="Show dead/stale sessions too")) -> None:
     """List live headless sessions (name, display, pid, cmd)."""
     _require_linux("ps")
     found = False
@@ -617,7 +697,9 @@ def ps() -> None:
             continue
         alive = bool(app_pid and proc_cmdline(app_pid)
                      and (not st.get("app_starttime") or proc_stat_starttime(app_pid) == st.get("app_starttime")))
-        rprint(f"{'🟢' if alive else '⚫'} {st.get('name')}  {st.get('display')}  pid={st.get('app')}  {st.get('cmd')}")
+        if not alive and not all:
+            continue
+        rprint(f"{'🟢' if alive else '⚫ gone'} {st.get('name')}  {st.get('display')}  pid={st.get('app')}  {st.get('cmd')}")
         found = True
     if not found:
         rprint("[dim]idle — no sessions.[/]")
