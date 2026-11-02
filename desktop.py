@@ -48,6 +48,15 @@ WIDTH, HEIGHT = 1280, 800
 XVFB_CANDIDATES = ["Xvfb", str(Path.home() / ".local" / "bin" / "Xvfb")]
 XVFB_ARGV0 = "boaz-Xvfb"  # ownership marker: sweep only kills OUR servers
 
+# Compositor / window-manager support (P0-1). Xvfb has no compositor: GL,
+# wgpu, SDL, GLFW, GPUI apps paint into a GL surface that never reaches the
+# X framebuffer, so root captures come back blank while the window claims
+# IsViewable. A lightweight WM with compositing (xfwm4 --compositor=on)
+# fixes most of these. Order matters: xfwm4 first (has a real compositor),
+# then picom/compton (compositors needing a WM beneath — still help),
+# then plain WMs (focus + stacking, no compositing).
+WM_CANDIDATES = ["xfwm4", "picom", "compton", "openbox", "mutter"]
+
 
 def session_path(name: str) -> str:
     safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
@@ -400,9 +409,167 @@ def window_state(display: str) -> tuple[str | None, str]:
     return None, _win_diag(display)
 
 
-def wait_for_window(display: str, timeout: float = 30.0) -> str:
-    """Poll until a non-root client window maps. Replaces the old blind sleep."""
+def pick_wm(prefer: str | None) -> str | None:
+    """Resolve a --with-wm value to a binary. 'auto' picks first available."""
+    if not prefer or prefer in ("none", "off", "no"):
+        return None
+    if prefer == "auto":
+        for c in WM_CANDIDATES:
+            if shutil.which(c):
+                return c
+        return None
+    if shutil.which(prefer):
+        return prefer
+    raise SystemExit(
+        f"unknown/unavailable WM {prefer!r} (have: "
+        f"{[c for c in WM_CANDIDATES if shutil.which(c)] or 'none'}). "
+        f"Install one (e.g. sudo apt install xfwm4) or use --with-wm auto.")
+
+
+def wm_argv(wm: str) -> list[str]:
+    if wm == "xfwm4":
+        return ["xfwm4", "--compositor=on"]
+    return [wm]
+
+
+def start_wm(display: str, wm: str, log_path: Path | None = None):
+    """Start a WM/compositor on DISPLAY. Returns the Popen (caller tracks pid)."""
+    env = display_env(display)
+    out = subprocess.DEVNULL
+    if log_path is not None:
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            out = open(log_path, "ab")
+        except OSError:
+            out = subprocess.DEVNULL
+    try:
+        return subprocess.Popen(wm_argv(wm), env=env, stdout=out, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+    finally:
+        if out is not subprocess.DEVNULL:
+            try:
+                out.close()
+            except Exception:
+                pass
+
+
+def list_windows(display: str) -> list[dict]:
+    """All client windows with title/geometry/map-state (for --window targeting)."""
+    env = display_env(display)
+    try:
+        r = subprocess.run(["xdotool", "search", "--name", ".*"],
+                             env=env, capture_output=True, text=True, timeout=5)
+        ids = r.stdout.split()
+    except Exception:
+        return []
+    out: list[dict] = []
+    for wid in ids:
+        try:
+            q = subprocess.run(["xwininfo", "-id", wid], env=env,
+                                 capture_output=True, text=True, timeout=5).stdout
+        except Exception:
+            continue
+        if "root window" in q:
+            continue
+        title = next((l.split(":", 1)[1].strip().strip('"') for l in q.splitlines()
+                        if 'Window id:' in l and '"' in l), "")
+        ms = next((l.split(":", 1)[1].strip() for l in q.splitlines()
+                     if "Map State:" in l), "?")
+        x = y = w = h = ""
+        for l in q.splitlines():
+            s = l.strip()
+            if s.startswith("Absolute upper-left X:"):
+                x = s.split(":", 1)[1].strip()
+            elif s.startswith("Absolute upper-left Y:"):
+                y = s.split(":", 1)[1].strip()
+            elif s.startswith("Width:"):
+                w = s.split(":", 1)[1].strip()
+            elif s.startswith("Height:"):
+                h = s.split(":", 1)[1].strip()
+        out.append({"id": wid, "title": title, "x": x, "y": y,
+                      "width": w, "height": h, "map": ms})
+    return out
+
+
+def resolve_window(display: str, selector: str | None) -> str | None:
+    """Resolve --window 'title:Sub' | 'id:0x...' | bare wid | 'first'."""
+    if not selector or selector in ("first", "any", "onlyvisible"):
+        wid, _ = window_state(display)
+        return wid
+    sel = selector.strip()
+    low = sel.lower()
+    if low.startswith(("title:", "title=", "name:")):
+        want = sel.split(":", 1)[1].strip() if ":" in sel else sel.split("=", 1)[1].strip()
+        if not want:
+            raise SystemExit("bad --window: title: needs a substring (e.g. title:VideoPsalm)")
+        for w in list_windows(display):
+            if want.lower() in (w.get("title") or "").lower():
+                return w["id"]
+        return None
+    if low.startswith(("id:", "id=")):
+        want = sel.split(":", 1)[1].strip() if ":" in sel else sel.split("=", 1)[1].strip()
+        return want or None
+    # bare window id (xdotool prints decimal, xwininfo hex — accept either)
+    return sel
+
+
+def focused_window(display: str) -> str | None:
+    env = display_env(display)
+    try:
+        r = subprocess.run(["xdotool", "getwindowfocus"], env=env,
+                             capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    wid = r.stdout.strip().split()[-1] if r.stdout.strip() else ""
+    if not wid or wid in ("0", "0x0"):
+        return None
+    return wid
+
+
+def ensure_focus(display: str, selector: str | None = None) -> str:
+    """Focus the target window (--sync) and fail LOUDLY when there is nothing to type into.
+
+    Every key/type/click/scroll/drag step calls this first: 'typed into
+    nothing' is a FAIL, never a silent no-op (P0-4)."""
     need_bins("xdotool", "xwininfo")
+    wid = resolve_window(display, selector)
+    if not wid:
+        raise RuntimeError(
+            f"no focusable window on {display} (selector={selector!r}). "
+            f"Windows: {_win_diag(display)}")
+    env = display_env(display)
+    try:
+        subprocess.run(["xdotool", "windowfocus", "--sync", wid], env=env,
+                         check=True, capture_output=True, text=True, timeout=10)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        raise RuntimeError(f"windowfocus --sync {wid} failed: {e}") from e
+    got = focused_window(display)
+    if not got:
+        raise RuntimeError(
+            f"no focused window after windowfocus {wid} on {display} "
+            f"(no WM? try --with-wm xfwm4). Windows: {_win_diag(display)}")
+    return got
+
+
+def wait_for_window(display: str, timeout: float = 30.0, selector: str | None = None) -> str:
+    """Poll until a non-root client window maps. Replaces the old blind sleep.
+
+    selector follows --window syntax (title:Sub | id:... | first)."""
+    need_bins("xdotool", "xwininfo")
+    # Fast path for title selectors: poll resolve_window directly.
+    if selector and selector.strip().lower().startswith(("title:", "title=", "name:")):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            wid = resolve_window(display, selector)
+            if wid:
+                return wid
+            time.sleep(0.5)
+        raise SystemExit(f"No window matching {selector!r} on {display} after {timeout}s. See `boaz log`.")
+    if selector and selector.strip().lower().startswith(("id:", "id=")):
+        return resolve_window(display, selector) or selector
+    if selector and selector not in ("first", "any", "onlyvisible"):
+        # bare wid: trust but verify it exists
+        return selector
     env = display_env(display)
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -453,22 +620,55 @@ def _win_diag(display: str) -> str:
     return "; ".join(parts)
 
 
+def _session_for_display(display: str) -> dict:
+    """Session owning DISPLAY (for retry-command hints). {} when unknown."""
+    for p in sessions_dir().glob("*.json"):
+        data = _read_json(p)
+        if isinstance(data, dict) and data.get("display") == display:
+            return data
+    return {}
+
+
 def _toolkit_hint(display: str) -> str:
-    """Suggest known flags when a blank screen matches a known toolkit."""
+    """Suggest known flags when a blank screen matches a known toolkit.
+
+    Includes the GL/compositor row (GPUI, wgpu, SDL, GLFW — anything that
+    paints into a GL surface Xvfb never composites) plus the exact retry
+    command (P0-1)."""
+    st = _session_for_display(display)
+    cmd = st.get("cmd", "<cmd>") if isinstance(st.get("cmd"), str) else "<cmd>"
+    nm = st.get("name", "app") if isinstance(st.get("name"), str) else "app"
+    retry = f'boaz launch "{cmd}" --name {nm} --with-wm xfwm4'
     for p in Path("/proc").glob("[0-9]*"):
         try:
-            cmd = (p / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").lower()
+            cmdline = (p / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").lower()
             env_raw = (p / "environ").read_bytes()
         except OSError:
             continue
         if display.encode() not in env_raw:
             continue
-        if "electron" in cmd:
-            return " Electron under Xvfb usually paints nothing without --disable-gpu — try adding it to your launch command."
-        if "java" in cmd:
-            return " Java apps under Xvfb may need -Dsun.java2d.xrender=false — try adding it."
-        if "qt" in cmd or "qpa" in cmd:
-            return " Qt apps under Xvfb may need QT_QPA_PLATFORM=xcb and QT_XCB_FORCE_SOFTWARE_OPENGL=1."
+        if "electron" in cmdline:
+            return (" Electron under Xvfb usually paints nothing without --disable-gpu"
+                    " — try adding it to your launch command.")
+        if "java" in cmdline:
+            return (" Java apps under Xvfb may need -Dsun.java2d.xrender=false"
+                    " — try adding it.")
+        if "qt" in cmdline or "qpa" in cmdline:
+            return (" Qt apps under Xvfb may need QT_QPA_PLATFORM=xcb and"
+                    " QT_XCB_FORCE_SOFTWARE_OPENGL=1.")
+        gl_keys = ("gpui", "wgpu", "sdl", "glfw", "glut", "godot", "unity",
+                     "unreal", "vulkan", "glx", "libgl", "libegl", "gtk")
+        if any(k in cmdline for k in gl_keys):
+            return (" GL/wgpu/SDL/GLFW/GPUI app suspected: it paints into a GL surface"
+                    f" that never reaches the X framebuffer on bare Xvfb. Retry with a compositor: {retry}")
+    # Fallback: IsViewable-but-blank is the compositor signature. The old
+    # message said 'IsViewable' and left the agent to work out that
+    # viewable != rendering — now we say it.
+    _wid, diag = window_state(display)
+    if "IsViewable" in diag:
+        return (" window is IsViewable but the frame is blank: viewable != rendering."
+                " Suspected GL/compositor issue (common for GPUI/wgpu/SDL/GLFW)."
+                f" Retry with a compositor: {retry}")
     return ""
 
 
@@ -480,6 +680,103 @@ def _variance_ok(path: Path) -> bool:
         return (ImageStat.Stat(small).stddev[0] or 0) > 1.5
     except Exception:
         return False  # undecodable frames never pass the gate
+
+
+def frame_delta(a: Path, b: Path, region: list[int] | None = None) -> float:
+    """Mean absolute per-pixel difference in [0,1] for region [x,y,w,h] (or full frame)."""
+    from PIL import Image, ImageChops, ImageStat
+    ia = Image.open(a).convert("L")
+    ib = Image.open(b).convert("L")
+    if region:
+        x, y, w, h = (int(v) for v in region)
+        if w <= 0 or h <= 0:
+            raise ValueError(f"bad region {region}: want positive w/h")
+        box = (max(x, 0), max(y, 0), max(x, 0) + w, max(y, 0) + h)
+        ia = ia.crop(box)
+        ib = ib.crop(box)
+    if ia.size != ib.size:
+        ib = ib.resize(ia.size)
+    return (ImageStat.Stat(ImageChops.difference(ia, ib)).mean[0] or 0) / 255.0
+
+
+def ocr_text(image: Path, region: list[int] | None = None) -> str:
+    """OCR a frame (or region) via tesseract TSV. Raises SystemExit with install hint."""
+    if not shutil.which("tesseract"):
+        raise SystemExit("Missing tesseract. Install: sudo apt install tesseract-ocr")
+    from PIL import Image
+    import tempfile
+    img = Image.open(image).convert("L")
+    if region:
+        x, y, w, h = (int(v) for v in region)
+        img = img.crop((max(x, 0), max(y, 0), max(x, 0) + w, max(y, 0) + h))
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+        tmp = Path(tf.name)
+    try:
+        img.save(tmp)
+        r = subprocess.run(["tesseract", str(tmp), "stdout", "tsv"],
+                             capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            raise SystemExit(f"tesseract failed: {(r.stderr or '').strip()[:200]}")
+        lines = r.stdout.splitlines()
+        if len(lines) < 2:
+            return ""
+        # TSV: level page_no block_no par_no line_no word_no left top width height conf text
+        words = []
+        for ln in lines[1:]:
+            parts = ln.split("\t")
+            if len(parts) >= 12 and parts[-1].strip():
+                words.append(parts[-1].strip())
+        return " ".join(words)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def ocr_find(image: Path, text: str) -> dict | None:
+    """Find text on a frame. Returns {x,y,w,h} of the first match, else None."""
+    if not shutil.which("tesseract"):
+        raise SystemExit("Missing tesseract. Install: sudo apt install tesseract-ocr")
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+        tmp = Path(tf.name)
+    try:
+        from PIL import Image
+        Image.open(image).convert("L").save(tmp)
+        r = subprocess.run(["tesseract", str(tmp), "stdout", "tsv"],
+                             capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            raise SystemExit(f"tesseract failed: {(r.stderr or '').strip()[:200]}")
+        lines = r.stdout.splitlines()
+        if len(lines) < 2:
+            return None
+        want = text.lower()
+        for ln in lines[1:]:
+            parts = ln.rstrip("\n").split("\t")
+            if len(parts) < 12:
+                continue
+            word = parts[-1] if len(parts) >= 12 else ""
+            # TSV word rows have 12 cols; line rows have 12 with empty word col? level col tells.
+            try:
+                left, top, w, h = (int(parts[6]), int(parts[7]), int(parts[8]), int(parts[9]))
+            except (ValueError, IndexError):
+                continue
+            if word and want in word.lower():
+                return {"x": left, "y": top, "w": w, "h": h, "text": word}
+        # fallback: substring across the whole page text (no box) — report full frame
+        return None
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def count_nonblank(frames: list[Path]) -> int:
+    """How many of the sampled frames pass the variance gate."""
+    n = 0
+    for f in frames:
+        try:
+            if _valid_png(f) and _variance_ok(f):
+                n += 1
+        except Exception:
+            continue
+    return n
 
 
 def _valid_png(path: Path) -> bool:

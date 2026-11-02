@@ -26,7 +26,10 @@ from desktop import (
     alloc_display, capture, confirm_display, display_env, display_taken, drop_session, load,
     need_session, proc_cmdline, proc_environ, proc_stat_starttime, release_display, safe_stem, save, session_path, sessions_dir, verified_kill, _read_json,
     wait_for_window, need_bins, xvfb_bin, GLOBAL_RESERVE,
+    pick_wm, start_wm, resolve_window, ensure_focus, list_windows, frame_delta, ocr_text, ocr_find, count_nonblank,
 )
+
+from typing import List
 
 sys.stdout.reconfigure(line_buffering=True)
 app = typer.Typer(help="Boaz — headless desktop tester. Agent sees the app, you don't (until ready).")
@@ -64,7 +67,58 @@ def _shot(name: str, out: str | None = None) -> str:
     stem = safe_stem(name)
     if out is None:
         out = str(_next_shot(stem))
-    return str(capture(st["display"], Path(out)))
+    p = str(capture(st["display"], Path(out)))
+    _archive_evidence(name, Path(p))
+    return p
+
+
+def _jprint(obj: dict) -> None:
+    print(json.dumps(obj))
+
+
+def _parse_env(items: List[str] | None) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for item in items or []:
+        if "=" not in item or item.startswith("="):
+            raise SystemExit(f"bad --env {item!r}: want K=V (repeatable, no shell quoting needed)")
+        k, v = item.split("=", 1)
+        if not k.strip():
+            raise SystemExit(f"bad --env {item!r}: empty key")
+        out[k] = v
+    return out
+
+
+def _evidence_dir(name: str) -> Path:
+    d = Path("evidence") / safe_stem(name)
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+def _archive_evidence(name: str, path: Path) -> None:
+    """Copy a capture/record into the per-session evidence dir (proof survives /tmp)."""
+    try:
+        if not path.is_file():
+            return
+        dest = _evidence_dir(name) / path.name
+        if path.resolve() == dest.resolve():
+            return
+        import shutil as _sh
+        _sh.copy2(path, dest)
+    except Exception:
+        pass
+
+
+def _resolve_capture_wid(display: str, window: str | None) -> str | None:
+    if not window:
+        return None
+    wid = resolve_window(display, window)
+    if not wid:
+        from desktop import _win_diag as _wd
+        raise SystemExit(f"No window matching {window!r} on {display}. {_wd(display)}")
+    return wid
 
 
 @app.command()
@@ -76,6 +130,10 @@ def launch(
     cwd: str = typer.Option(None, help="Working dir for the app (default: your current $PWD)"),
     width: int = typer.Option(WIDTH, help="Headless screen width"),
     height: int = typer.Option(HEIGHT, help="Headless screen height"),
+    with_wm: str = typer.Option(None, "--with-wm", help="WM/compositor: xfwm4|picom|compton|openbox|mutter|auto|none"),
+    wait_window: str = typer.Option(None, "--wait-window", help="Wait for window title:Sub instead of any window"),
+    env: List[str] = typer.Option([], "--env", help="Env passthrough K=V (repeatable, no shell quoting needed)"),
+    json_out: bool = typer.Option(False, "--json", help="Machine-readable output"),
 ) -> None:
     """Launch an app headless on its own DISPLAY. Never touches your :0."""
     _require_linux("launch")
@@ -90,6 +148,8 @@ def launch(
     for dim, val in (("width", width), ("height", height)):
         if not 320 <= val <= 7680:
             raise SystemExit(f"bad {dim}={val}: want 320-7680 (a real screen size)")
+    extra_env = _parse_env(env)
+    wm_bin = pick_wm(with_wm) if with_wm else None
     kept = _kill([name], sweep=False, force=False, quiet=True)
     if name in kept:
         raise SystemExit(f"session '{name}' kept a live unverified process — refusing to overwrite it. Use --force with kill first.")
@@ -130,10 +190,24 @@ def launch(
             pass
         release_display(num)
         raise SystemExit(f"cannot open log {log}: {e}")
+    wm_proc = None
+    if wm_bin:
+        try:
+            wm_proc = start_wm(display, wm_bin, log)
+            time.sleep(1.0)  # let the compositor claim the display first
+            if wm_proc.poll() is not None:
+                rprint(f"[yellow]WM {wm_bin} exited immediately; continuing without compositor.[/]")
+                wm_proc = None
+        except SystemExit:
+            raise
+        except Exception as e:
+            rprint(f"[yellow]could not start WM {wm_bin}: {e}; continuing bare.[/]")
+            wm_proc = None
     try:
         with lf:
             app_token = uuid.uuid4().hex
             app_env = dict(display_env(display), BOAZ_APP_TOKEN=app_token)
+            app_env.update(extra_env)
             proc = subprocess.Popen(cmd, shell=True, env=app_env, cwd=run_cwd,
                                     stdout=lf, stderr=subprocess.STDOUT,
                                     start_new_session=True)  # own process group: kill takes children too
@@ -141,7 +215,10 @@ def launch(
         save(name, {"xvfb": xvfb.pid, "xvfb_starttime": proc_stat_starttime(xvfb.pid),
                     "app": proc.pid, "app_starttime": proc_stat_starttime(proc.pid),
                     "boot_id": _boot(), "app_token": app_token,
-                    "cmd": cmd, "display": display, "name": name, "cwd": run_cwd})
+                    "cmd": cmd, "display": display, "name": name, "cwd": run_cwd,
+                    "wm": (wm_proc.pid if wm_proc else None),
+                    "wm_starttime": (proc_stat_starttime(wm_proc.pid) if wm_proc else ""),
+                    "wm_name": (wm_bin or ""), "env": extra_env})
     except BaseException:
         try:
             xvfb.kill()
@@ -150,7 +227,7 @@ def launch(
         drop_session(name)
         raise
     try:
-        wid = wait_for_window(display, timeout=wait)
+        wid = wait_for_window(display, timeout=wait, selector=wait_window)
     except SystemExit:
         from desktop import window_state as _ws
         rprint(f"[yellow]launched in {run_cwd} but no window mapped after {wait}s on {display}.[/]")
@@ -160,7 +237,14 @@ def launch(
     if xvfb.poll() is not None:
         raise SystemExit(f"Xvfb died under session '{name}'.")
     shot = _shot(name)
-    rprint(f"[bold green]Boaz running headless[/] session={name} display={display} pid={proc.pid} window={wid} cwd={run_cwd}")
+    env_note = f" env={extra_env}" if extra_env else ""
+    wm_note = f" wm={wm_bin}" if wm_bin else ""
+    if json_out:
+        _jprint({"session": name, "display": display, "pid": proc.pid, "window": wid,
+                   "cwd": run_cwd, "shot": shot, "log": str(log),
+                   "wm": wm_bin or None, "env": extra_env})
+        return
+    rprint(f"[bold green]Boaz running headless[/] session={name} display={display} pid={proc.pid} window={wid} cwd={run_cwd}{wm_note}{env_note}")
     rprint(f"[dim]You see nothing. Agent reads: {shot}  Log: {log}[/]")
 
 
@@ -169,6 +253,8 @@ def wait(
     name: str = typer.Option("app", help="Session name"),
     for_: str = typer.Option("mapped", "--for", help="Condition: mapped|painted"),
     timeout: float = typer.Option(120.0, help="Max seconds to wait"),
+    window: str = typer.Option(None, "--window", help="Window selector title:Sub|id:...|first"),
+    json_out: bool = typer.Option(False, "--json", help="Machine-readable output"),
 ) -> None:
     """Block until a window maps (or paints), for slow cold-starts. Exits 0/2."""
     _require_linux("wait")
@@ -180,10 +266,13 @@ def wait(
     from desktop import window_state as _ws
     if for_ == "mapped":
         try:
-            wid = wait_for_window(st["display"], timeout=timeout)
+            wid = wait_for_window(st["display"], timeout=timeout, selector=window)
         except SystemExit:
             rprint(f"[yellow]no window mapped on {st['display']} after {timeout}s. {_ws(st['display'])[1]}[/]")
             raise typer.Exit(2)
+        if json_out:
+            _jprint({"session": name, "display": st["display"], "window": wid, "for": for_})
+            return
         rprint(f"[bold green]mapped[/] window={wid} display={st['display']}")
         return
     # painted: mapped AND a non-blank capture succeeds
@@ -192,6 +281,9 @@ def wait(
     while time.time() < deadline:
         try:
             shot = _shot(name)
+            if json_out:
+                _jprint({"session": name, "display": st["display"], "for": for_, "shot": shot})
+                return
             rprint(f"[bold green]painted[/] {shot}")
             return
         except SystemExit as e:
@@ -205,41 +297,44 @@ def wait(
 def screenshot(
     out: str = typer.Option(None, help="Output path (default shots/<name>-NNN.png, CWD-relative)"),
     name: str = typer.Option("app", help="Session name"),
-    window: bool = typer.Option(False, help="Grab the app window only (xwd) instead of root"),
+    window: str = typer.Option(None, "--window", help="Grab one window: title:Sub|id:...|first (was a bare flag)"),
+    json_out: bool = typer.Option(False, "--json", help="Machine-readable output"),
 ) -> None:
     """Capture the headless display to PNG. Agent reads this with vision."""
     _require_linux("screenshot")
     st = need_session(name)
-    wid = None
     stem = safe_stem(name)
-    if window:
-        need_bins("xdotool")
-        r = subprocess.run(["xdotool", "search", "--onlyvisible", "--name", ".*"], timeout=10,
-                           env=display_env(st["display"]), capture_output=True, text=True)
-        ids = r.stdout.split()
-        wid = ids[0] if ids else None
-    if wid is None and window:
+    wid = _resolve_capture_wid(st["display"], window) if window else None
+    if window and not wid:
         raise SystemExit(f"No mapped window on {st['display']} yet.")
-    rprint(_shot(name, out) if wid is None
-           else str(capture(st["display"], Path(out) if out else
-                            _next_shot(stem, "-win"), wid)))
+    path = _shot(name, out) if wid is None else str(capture(st["display"], Path(out) if out else _next_shot(stem, "-win"), wid))
+    if wid is not None:
+        _archive_evidence(name, Path(path))
+    if json_out:
+        from desktop import _win_diag as _wd
+        _jprint({"session": name, "display": st["display"], "window": wid, "path": path,
+                   "diag": _wd(st["display"])})
+        return
+    rprint(path)
 
 
 @app.command()
 def run(
     script: str = typer.Argument(..., help="JSON steps file, e.g. tests/flow.json"),
     name: str = typer.Option("app", help="Session name"),
+    window: str = typer.Option(None, "--window", help="Focus target title:Sub|id:...|first"),
+    json_out: bool = typer.Option(False, "--json", help="Machine-readable output"),
 ) -> None:
     """Drive the headless app (xdotool) + screenshot every step. Prints PASS/FAIL.
 
     x,y are root-display coordinates as seen in screenshots (window sits at +0+20 under root).
     """
-    ok = _run(script, name)
+    ok = _run(script, name, window=window, json_out=json_out)
     raise typer.Exit(0 if ok else 1)
 
 
-def _run(script: str, name: str) -> bool:
-    _EXAMPLES = {"wait": '{"action":"wait","seconds":2}', "key": '{"action":"key","keys":"Escape"}', "type": '{"action":"type","text":"hi"}', "click": '{"action":"click","x":640,"y":400}', "scroll": '{"action":"scroll","x":640,"y":400,"clicks":3,"dir":"down"}', "drag": '{"action":"drag","x1":100,"y1":200,"x2":300,"y2":400}', "screenshot": '{"action":"screenshot"}'}
+def _run(script: str, name: str, window: str | None = None, json_out: bool = False) -> bool:
+    _EXAMPLES = {"wait": '{"action":"wait","seconds":2}', "key": '{"action":"key","keys":"Escape"}', "type": '{"action":"type","text":"hi"}', "click": '{"action":"click","x":640,"y":400}', "scroll": '{"action":"scroll","x":640,"y":400,"clicks":3,"dir":"down"}', "drag": '{"action":"drag","x1":100,"y1":200,"x2":300,"y2":400}', "screenshot": '{"action":"screenshot","as":"a"}', "assert_changed": '{"action":"assert_changed","vs":"a","region":[100,100,200,150],"min_delta":0.01}', "assert_text": '{"action":"assert_text","contains":"John 3:16"}'}
     _require_linux("run")
     need_bins("xdotool")
     st = need_session(name)
@@ -256,9 +351,17 @@ def _run(script: str, name: str) -> bool:
         raise SystemExit(f"bad script {script}: top level must be a JSON list of steps")
     env = display_env(st["display"])
     ok = True
+    aliases: dict[str, str] = {}  # screenshot "as" name -> shot path
+    failures: list[dict] = []
     for i, s in enumerate(steps):
         a = s.get("action") if isinstance(s, dict) else None
         try:
+            if a in ("key", "type", "click", "scroll", "drag"):
+                # P0-4: focus first, fail loudly when there is nothing to drive.
+                try:
+                    ensure_focus(st["display"], (s.get("window") or window))
+                except RuntimeError as e:
+                    raise ValueError(f"no focus ({e})")
             if a == "wait":
                 secs = s.get("seconds", 1)
                 try:
@@ -310,32 +413,93 @@ def _run(script: str, name: str) -> bool:
                                 "mousemove", str(x2), str(y2), "mouseup", "1"],
                                env=env, check=True, timeout=10)
             elif a == "screenshot":
-                pass  # every step screenshots anyway
+                alias = s.get("as")
+                if alias is not None and not isinstance(alias, str):
+                    raise ValueError("screenshot 'as' needs a string alias")
+                pass  # every step screenshots anyway; alias wired after the shot
+            elif a == "assert_changed":
+                vs = s.get("vs")
+                if not isinstance(vs, str) or vs not in aliases:
+                    raise ValueError(f"assert_changed needs 'vs' naming an earlier screenshot as: (have {sorted(aliases) or 'none'})")
+                region = s.get("region")
+                if region is not None:
+                    try:
+                        region = [int(v) for v in region]
+                    except (TypeError, ValueError):
+                        raise ValueError(f"assert_changed needs region [x,y,w,h], got {region!r}")
+                    if len(region) != 4:
+                        raise ValueError(f"assert_changed needs region [x,y,w,h], got {region!r}")
+                try:
+                    min_delta = float(s.get("min_delta", 0.01))
+                except (TypeError, ValueError):
+                    raise ValueError(f"assert_changed needs numeric min_delta, got {s.get('min_delta')!r}")
+                # compare against the CURRENT frame: capture now, diff vs alias.
+                cur = _shot(name)
+                aliases[f"__cur_{i}"] = cur
+                delta = frame_delta(Path(aliases[vs]), Path(cur), region)
+                if delta < min_delta:
+                    raise ValueError(f"assert_changed FAIL: delta={delta:.4f} < min_delta={min_delta} region={region}")
+                rprint(f"  [{i}] assert_changed ok delta={delta:.4f}")
+            elif a == "assert_text":
+                want = s.get("contains", s.get("text"))
+                if not isinstance(want, str) or not want:
+                    raise ValueError("assert_text needs 'contains' string")
+                region = s.get("region")
+                if region is not None:
+                    try:
+                        region = [int(v) for v in region]
+                    except (TypeError, ValueError):
+                        raise ValueError(f"assert_text needs region [x,y,w,h], got {region!r}")
+                    if len(region) != 4:
+                        raise ValueError(f"assert_text needs region [x,y,w,h], got {region!r}")
+                cur = _shot(name)
+                aliases[f"__cur_{i}"] = cur
+                got = ocr_text(Path(cur), region)
+                if want.lower() not in got.lower():
+                    raise ValueError(f"assert_text FAIL: {want!r} not in OCR {got[:120]!r}")
+                rprint(f"  [{i}] assert_text ok")
             else:
-                raise ValueError(f"unknown action {a!r} (want wait|key|type|click|scroll|drag|screenshot). Example: { _EXAMPLES.get(a) if isinstance(a, str) and a in _EXAMPLES else _EXAMPLES['click'] }")
-            rprint(f"  [{i}] {a} ok")
+                raise ValueError(f"unknown action {a!r} (want wait|key|type|click|scroll|drag|screenshot|assert_changed|assert_text). Example: { _EXAMPLES.get(a) if isinstance(a, str) and a in _EXAMPLES else _EXAMPLES['click'] }")
+            if a not in ("assert_changed", "assert_text"):
+                rprint(f"  [{i}] {a} ok")
         except (KeyError, TypeError, ValueError) as e:
             ex = _EXAMPLES.get(a, _EXAMPLES["wait"]) if isinstance(a, str) else _EXAMPLES["wait"]
-            rprint(f"[bold red]  [{i}] {a} FAIL: {e}. Example: {ex}[/]")
+            msg = f"  [{i}] {a} FAIL: {e}. Example: {ex}"
+            rprint(f"[bold red]{msg}[/]")
+            failures.append({"index": i, "action": a, "error": str(e)})
             ok = False
             break
         except subprocess.CalledProcessError as e:
-            rprint(f"[bold red]  [{i}] {a} FAIL: xdotool exit {e.returncode}[/]")
+            msg = f"  [{i}] {a} FAIL: xdotool exit {e.returncode}"
+            rprint(f"[bold red]{msg}[/]")
+            failures.append({"index": i, "action": a, "error": msg})
             ok = False
             break
         except subprocess.TimeoutExpired:
-            rprint(f"[bold red]  [{i}] {a} FAIL: xdotool timed out[/]")
+            msg = f"  [{i}] {a} FAIL: xdotool timed out"
+            rprint(f"[bold red]{msg}[/]")
+            failures.append({"index": i, "action": a, "error": msg})
             ok = False
             break
-        try:
-            shot = _shot(name)
-        except SystemExit as e:
-            rprint(f"[bold red]  [{i}] {a} FAIL: capture: {e}[/]")
-            ok = False
-            break
+        if a in ("assert_changed", "assert_text"):
+            shot = aliases.get(f"__cur_{i}", "")
+        else:
+            try:
+                shot = _shot(name)
+            except SystemExit as e:
+                msg = f"  [{i}] {a} FAIL: capture: {e}"
+                rprint(f"[bold red]{msg}[/]")
+                failures.append({"index": i, "action": a, "error": str(e)})
+                ok = False
+                break
+            if isinstance(s, dict) and a == "screenshot" and isinstance(s.get("as"), str):
+                aliases[s["as"]] = shot
         if i == 0:
             rprint(f"[dim]first frame: {shot}[/]")
-    rprint("[bold green]PASS[/]" if ok else "[bold red]FAIL[/]")
+    if json_out:
+        _jprint({"session": name, "ok": ok, "aliases": aliases, "failures": failures})
+    else:
+        rprint("[bold green]PASS[/]" if ok else "[bold red]FAIL[/]")
     return ok
 
 
@@ -345,11 +509,30 @@ def record(
     name: str = typer.Option("app", help="Session name"),
     script: str = typer.Option(None, help="Optional JSON script to drive while recording"),
     seconds: float = typer.Option(5.0, help="Static capture length when no script"),
+    window: str = typer.Option(None, "--window", help="Record one window: title:Sub|id:...|first (x11grab offset)"),
+    json_out: bool = typer.Option(False, "--json", help="Machine-readable output"),
 ) -> None:
     """Record the headless display via ffmpeg x11grab. No window on your screen."""
     _require_linux("record")
     need_bins("ffmpeg", "ffprobe")
     st = need_session(name)
+    grab = st["display"]
+    if window:
+        wid = _resolve_capture_wid(st["display"], window)
+        try:
+            q = subprocess.run(["xwininfo", "-id", wid], env=display_env(st["display"]),
+                                 capture_output=True, text=True, timeout=5).stdout
+            import re as _re
+            mx = _re.search(r"Absolute upper-left X:\s*(\d+)", q)
+            my = _re.search(r"Absolute upper-left Y:\s*(\d+)", q)
+            mw = _re.search(r"^\s*Width:\s*(\d+)", q, _re.M)
+            mh = _re.search(r"^\s*Height:\s*(\d+)", q, _re.M)
+            if mx and my and mw and mh:
+                grab = f"{st['display']}+{mx.group(1)},{my.group(1)}"
+                # size set via -video_size below
+                st = dict(st, _grab_size=f"{mw.group(1)}x{mh.group(1)}")
+        except Exception:
+            pass
     out = out or str(_shots_dir() / f"{safe_stem(name)}.mp4")
     if Path(out).is_dir():
         raise SystemExit(f"cannot write {out}: is a directory")
@@ -374,14 +557,17 @@ def record(
     except OSError as e:
         raise SystemExit(f"cannot open ffmpeg log {errlog}: {e}")
     with ef:
+        ff_cmd = ["ffmpeg", "-y", "-f", "x11grab", "-draw_mouse", "0", "-r", "10"]
+        if st.get("_grab_size"):
+            ff_cmd += ["-video_size", st["_grab_size"]]
+        ff_cmd += ["-i", grab, "-vcodec", "libx264", "-preset", "ultrafast", tmp_out]
         ff = subprocess.Popen(
-            ["ffmpeg", "-y", "-f", "x11grab", "-draw_mouse", "0", "-r", "10", "-i", st["display"],
-             "-vcodec", "libx264", "-preset", "ultrafast", tmp_out],
+            ff_cmd,
             stdout=subprocess.DEVNULL, stderr=ef)
         script_ok = True
         try:
             if script:
-                script_ok = _run(script, name)
+                script_ok = _run(script, name, window=window)
             else:
                 time.sleep(seconds)
                 rprint(f"[dim]static capture {seconds}s[/]")
@@ -430,6 +616,8 @@ def record(
     except (subprocess.TimeoutExpired, ValueError, OSError):
         total = 0.1
     flat = True
+    nonblank = 0
+    sampled = 0
     for pos in (0.0, total / 2, max(total - 0.2, 0.0)):
         try:
             fr = subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", str(round(pos, 2)),
@@ -441,19 +629,98 @@ def record(
         try:
             from PIL import Image, ImageStat
             import io as _io
+            sampled += 1
             if (ImageStat.Stat(Image.open(_io.BytesIO(fr.stdout)).convert("L").resize((160, 100))).stddev[0] or 0) > 1.5:
                 flat = False
-                break
+                nonblank += 1
         except Exception:
             continue
     if flat:
-        _fail("record is blank (no pixel variance) — was the app running?")
+        _fail(f"record is blank (no pixel variance — {n} frames, {nonblank} non-blank) — was the app running?")
     os.replace(tmp_out, out)
-    rprint(f"[bold green]saved[/] {out} ({n} frames)")
+    _archive_evidence(name, Path(out))
+    if json_out:
+        _jprint({"session": name, "path": out, "frames": int(n) if str(n).strip().isdigit() else n,
+                   "nonblank": nonblank, "sampled": sampled})
+        return
+    rprint(f"[bold green]saved[/] {out} ({n} frames) {nonblank}/{sampled} non-blank")
 
 
 @app.command()
-def show(name: str = typer.Option("app", help="Session name")) -> None:
+def find(
+    name: str = typer.Option("app", help="Session name"),
+    text: str = typer.Option(..., "--text", help="Substring to locate on the live frame"),
+    window: str = typer.Option(None, "--window", help="Limit OCR to one window title:Sub|id:...|first"),
+    json_out: bool = typer.Option(False, "--json", help="Machine-readable output"),
+) -> None:
+    """Locate text on the live headless frame (tesseract). Prints x y w h."""
+    _require_linux("find")
+    st = need_session(name)
+    wid = _resolve_capture_wid(st["display"], window) if window else None
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+        tmp = Path(tf.name)
+    try:
+        capture(st["display"], tmp, wid)
+        hit = ocr_find(tmp, text)
+    finally:
+        tmp.unlink(missing_ok=True)
+    if not hit:
+        raise SystemExit(f"text {text!r} not found on {st['display']} (window={wid or 'root'})")
+    if json_out:
+        _jprint({"session": name, "display": st["display"], "window": wid,
+                   "text": text, **{k: hit[k] for k in ("x", "y", "w", "h")}})
+        return
+    rprint(f"{hit['x']} {hit['y']} {hit['w']} {hit['h']}")
+
+
+@app.command()
+def evidence(
+    name: str = typer.Option("app", help="Session name"),
+    out: str = typer.Option(None, help="Bundle path (default evidence/<name>.tar.gz)"),
+    json_out: bool = typer.Option(False, "--json", help="Machine-readable output"),
+) -> None:
+    """Bundle per-session evidence (shots + log + session) into a tarball."""
+    _require_linux("evidence")
+    import tarfile
+    stem = safe_stem(name)
+    out = out or str(Path("evidence") / f"{stem}.tar.gz")
+    try:
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        raise SystemExit(f"cannot write {out}: {e}")
+    members: list[str] = []
+    with tarfile.open(out, "w:gz") as tf:
+        for pat in (f"{stem}-*.png", f"{stem}.mp4"):
+            for f in _shots_dir().glob(pat):
+                try:
+                    tf.add(f, arcname=f"shots/{f.name}")
+                    members.append(f"shots/{f.name}")
+                except OSError:
+                    pass
+        for f in _evidence_dir(name).glob("*"):
+            try:
+                if f.is_file():
+                    tf.add(f, arcname=f"evidence/{f.name}")
+                    members.append(f"evidence/{f.name}")
+            except OSError:
+                pass
+        for f in (sessions_dir() / f"{stem}.json", sessions_dir() / f"{stem}.log"):
+            try:
+                if f.is_file():
+                    tf.add(f, arcname=f"session/{f.name}")
+                    members.append(f"session/{f.name}")
+            except OSError:
+                pass
+    if json_out:
+        _jprint({"session": name, "bundle": out, "members": members})
+        return
+    rprint(f"[bold green]bundled[/] {out} ({len(members)} files)")
+
+
+@app.command()
+def show(name: str = typer.Option("app", help="Session name"),
+         json_out: bool = typer.Option(False, "--json", help="Machine-readable output")) -> None:
     """Relaunch the same command visibly for the human. Only when READY_FOR_HUMAN."""
     _require_linux("show")
     st = load(name)
@@ -464,6 +731,9 @@ def show(name: str = typer.Option("app", help="Session name")) -> None:
         raise SystemExit(
             f"refusing show: DISPLAY={human!r} is empty or headless. "
             "Run `boaz show` from your visible desktop session.")
+    if json_out:
+        _jprint({"session": name, "cmd": _cmd(st), "display": st.get("display")})
+        return
     rprint(f"[yellow]Re-launching visibly for YOU to test:[/] {_cmd(st)}")
     rprint("[dim]Headless session keeps running untouched.[/]")
     subprocess.Popen(_cmd(st), shell=True)
@@ -471,7 +741,8 @@ def show(name: str = typer.Option("app", help="Session name")) -> None:
 
 @app.command()
 def log(name: str = typer.Option("app", help="Session name"),
-        lines: int = typer.Option(30, help="Tail lines")) -> None:
+        lines: int = typer.Option(30, help="Tail lines"),
+        json_out: bool = typer.Option(False, "--json", help="Machine-readable output")) -> None:
     """Show the headless app's stdout/stderr (why no window yet?)."""
     _require_linux("log")
     p = sessions_dir() / f"{safe_stem(name)}.log"
@@ -481,7 +752,11 @@ def log(name: str = typer.Option("app", help="Session name"),
         text = p.read_text(errors="replace")
     except OSError as e:
         raise SystemExit(f"cannot read log {p}: {e}")
-    rprint("".join(text.splitlines(True)[-lines:]))
+    tail = "".join(text.splitlines(True)[-lines:])
+    if json_out:
+        _jprint({"session": name, "log": str(p), "lines": lines, "text": tail})
+        return
+    rprint(tail)
 
 
 @app.command()
@@ -489,10 +764,13 @@ def kill(name: str = typer.Option("app", help="Session name (or --all)"),
          all: bool = typer.Option(False, help="Kill every session"),
          sweep: bool = typer.Option(False, help="Also reap orphan boaz Xvfb servers (argv[0]-marked only)"),
          force: bool = typer.Option(False, help="Drop the session without signalling (stale/PID-recycled state)"),
-         quiet: bool = typer.Option(False, help="No output")) -> None:
+         quiet: bool = typer.Option(False, help="No output"),
+         json_out: bool = typer.Option(False, "--json", help="Machine-readable output")) -> None:
     """Kill headless session(s). Verifies cmdline+starttime — never kills strangers."""
     _require_linux("kill")
-    kept = _kill([p.stem for p in sessions_dir().glob("*.json")] if all else [name], sweep, force, quiet)
+    kept = _kill([p.stem for p in sessions_dir().glob("*.json")] if all else [name], sweep, force, quiet and not json_out)
+    if json_out:
+        _jprint({"kept": kept, "ok": not kept})
     if kept:
         raise typer.Exit(3)
 
@@ -570,6 +848,13 @@ def _kill(names: list[str], sweep: bool, force: bool, quiet: bool) -> list[str]:
                 rprint(f"[dim]{n}: force-dropped without signalling (PIDs left alone).[/]")
             continue
         # D6: handle each pid independently; drop only when nothing alive survives.
+        # P2: pid 1 is init — it can never be our app. A session claiming app pid 1
+        # is a recycled/dead namespace leftover: forget it without signalling.
+        if app_pid == 1 and not _app_is_ours(1, st):
+            drop_session(n)
+            if not quiet:
+                rprint(f"[dim]{n}: already dead, forgot it (stale pid 1).[/]")
+            continue
         leftovers: list[str] = []
         if app_pid and proc_cmdline(app_pid):
             if _app_is_ours(app_pid, st):
@@ -600,6 +885,15 @@ def _kill(names: list[str], sweep: bool, force: bool, quiet: bool) -> list[str]:
                 leftovers.append(f"unverified group pgid={app_pid} ({len(members)} members) kept")
                 if not quiet:
                     rprint(f"[dim]{n}:group identity unverified — session kept. Use --force to drop.[/]")
+        # WM goes down with the session (verified like Xvfb, never strangers).
+        wm_pid = _coerce_pid(st.get("wm"))
+        if wm_pid and proc_cmdline(wm_pid):
+            wm_name = st.get("wm_name", "") or "xfwm4"
+            if proc_cmdline(wm_pid) and wm_name.split()[0] in proc_cmdline(wm_pid):
+                if verified_kill(wm_pid, wm_name.split()[0], st.get("wm_starttime", "")):
+                    pass
+            if proc_cmdline(wm_pid):
+                leftovers.append(f"WM pid={wm_pid}")
         if xvfb_pid and proc_cmdline(xvfb_pid):
             if verified_kill(xvfb_pid, XVFB_ARGV0, st.get("xvfb_starttime", "")):
                 pass
@@ -678,9 +972,13 @@ def _x11_server_pids() -> list[int]:
 
 
 @app.command()
-def ps(all: bool = typer.Option(False, help="Show dead/stale sessions too")) -> None:
+def ps(all: bool = typer.Option(False, help="Show dead/stale sessions too"),
+       json_out: bool = typer.Option(False, "--json", help="Machine-readable output")) -> None:
     """List live headless sessions (name, display, pid, cmd)."""
     _require_linux("ps")
+    # P2: ps never touches the display (no sockets, no xdotool) so a dead
+    # display can't hang it. Only /proc + session files, each guarded.
+    rows: list[dict] = []
     found = False
     for p in sorted(sessions_dir().glob("*.json")):
         try:
@@ -688,25 +986,45 @@ def ps(all: bool = typer.Option(False, help="Show dead/stale sessions too")) -> 
             if not isinstance(st, dict):
                 raise ValueError("not a dict")
         except (ValueError, OSError, RecursionError):
-            rprint(f"[dim]⚠ {p.stem}: unreadable session file — `boaz kill --name {p.stem}` to clear.[/]")
+            if json_out:
+                rows.append({"name": p.stem, "alive": False, "error": "unreadable"})
+            else:
+                rprint(f"[dim]⚠ {p.stem}: unreadable session file — `boaz kill --name {p.stem}` to clear.[/]")
             continue
         app_pid, _x = _coerce_pids(st)
         if st.get("app") is not None and app_pid is None:
-            rprint(f"[dim]⚠ {p.stem}: wrong-typed pids — `boaz kill --name {p.stem}` to clear.[/]")
+            if json_out:
+                rows.append({"name": p.stem, "alive": False, "error": "wrong-typed pids"})
+            else:
+                rprint(f"[dim]⚠ {p.stem}: wrong-typed pids — `boaz kill --name {p.stem}` to clear.[/]")
             found = True
             continue
-        alive = bool(app_pid and proc_cmdline(app_pid)
-                     and (not st.get("app_starttime") or proc_stat_starttime(app_pid) == st.get("app_starttime")))
-        if not alive and not all:
+        try:
+            alive = bool(app_pid and proc_cmdline(app_pid)
+                         and (not st.get("app_starttime") or proc_stat_starttime(app_pid) == st.get("app_starttime")))
+        except Exception:
+            alive = False
+        if not alive and not all and not json_out:
             continue
-        rprint(f"{'🟢' if alive else '⚫ gone'} {st.get('name')}  {st.get('display')}  pid={st.get('app')}  {st.get('cmd')}")
+        if not alive and not all and json_out:
+            rows.append({"name": st.get("name"), "display": st.get("display"),
+                           "pid": st.get("app"), "alive": False, "cmd": st.get("cmd")})
+            found = True
+            continue
+        rows.append({"name": st.get("name"), "display": st.get("display"),
+                       "pid": st.get("app"), "alive": alive, "cmd": st.get("cmd")})
+        if not json_out:
+            rprint(f"{'🟢' if alive else '⚫ gone'} {st.get('name')}  {st.get('display')}  pid={st.get('app')}  {st.get('cmd')}")
         found = True
+    if json_out:
+        _jprint({"sessions": rows})
+        return
     if not found:
         rprint("[dim]idle — no sessions.[/]")
 
 
 @app.command()
-def doctor() -> None:
+def doctor(json_out: bool = typer.Option(False, "--json", help="Machine-readable output")) -> None:
     """Readiness check: what headless testing can do on THIS machine."""
     xlibs = str(Path.home() / ".local" / "bin" / "Xvfb")
     rows = [
@@ -720,11 +1038,127 @@ def doctor() -> None:
         ("ffprobe", shutil.which("ffprobe"), "ships with ffmpeg"),
         ("scrot", shutil.which("scrot"), "sudo apt install scrot"),
         ("convert", shutil.which("convert"), "sudo apt install imagemagick"),
+        ("tesseract", shutil.which("tesseract"), "sudo apt install tesseract-ocr (find/assert_text need it)"),
+        ("xfwm4 (compositor)", shutil.which("xfwm4"), "sudo apt install xfwm4 (GL apps need a compositor)"),
+        ("glxgears (GL probe)", shutil.which("glxgears"), "sudo apt install mesa-utils (doctor GL smoke-test)"),
         ("/dev/dri (GPU)", str(Path("/dev/dri/card0").exists()), "rootless sandboxes use Lavapipe software GL"),
         ("Lavapipe Vulkan", str(Path("/usr/share/vulkan/icd.d/lvp_icd.json").exists()), "mesa-vulkan-drivers"),
     ]
+    # P0-2: smoke-test the actual render path, not just the toolchain. A green
+    # doctor that can't render is worse than no doctor: spawn scratch Xvfbs and
+    # prove X apps AND GL apps are separately capturable.
+    render = _doctor_render_probe() if platform.system() == "Linux" else {"x_capturable": "skip", "gl_capturable": "skip", "detail": "non-Linux"}
+    rows.append(("X apps capturable", render.get("x_capturable"), render.get("detail", "")))
+    rows.append(("GL apps capturable", render.get("gl_capturable"), render.get("gl_detail", render.get("detail", ""))))
+    if json_out:
+        _jprint({"tools": [{"label": l, "have": bool(h), "detail": str(h)} for l, h, _ in rows],
+                   "render": render})
+        return
     for label, have, hint in rows:
         rprint(f"{'✅' if have else '❌'} {label}: {have if have else 'MISSING — ' + hint}")
+
+
+def _doctor_render_probe() -> dict:
+    """Scratch-Xvfb render smoke test. Returns x/gl capturable yes/no separately."""
+    import tempfile
+    try:
+        num = alloc_display()
+    except SystemExit as e:
+        return {"x_capturable": "no", "gl_capturable": "unknown", "detail": f"no display: {e}"}
+    display = f":{num}"
+    try:
+        xvfb_path = xvfb_bin()
+    except SystemExit as e:
+        release_display(num)
+        return {"x_capturable": "no", "gl_capturable": "unknown", "detail": str(e)}
+    xvfb = subprocess.Popen([XVFB_ARGV0, display, "-screen", "0", "800x600x24"],
+                              executable=xvfb_path, env=dict(display_env(display), BOAZ_POOL=str(sessions_dir())),
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if xvfb.poll() is not None:
+                break
+            if display_taken(num):
+                break
+            time.sleep(0.2)
+        if xvfb.poll() is not None or not display_taken(num):
+            return {"x_capturable": "no", "gl_capturable": "unknown", "detail": "Xvfb never came up"}
+        env = display_env(display)
+        x_ok, x_detail = False, ""
+        xlogo = str(Path.home() / ".local" / "x11apps" / "usr" / "bin" / "xlogo")
+        x_bin = xlogo if Path(xlogo).exists() else (shutil.which("xlogo") or shutil.which("xeyes") or shutil.which("xclock"))
+        if not x_bin:
+            x_detail = "no X test app (xlogo/xeyes/xclock) — toolchain only"
+        else:
+            xp = subprocess.Popen([x_bin], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    start_new_session=True)
+            try:
+                try:
+                    wid = wait_for_window(display, timeout=8.0)
+                except SystemExit as e:
+                    x_detail = f"{Path(x_bin).name} never mapped: {e}"
+                    wid = None
+                if wid:
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+                        tmp = Path(tf.name)
+                    try:
+                        capture(display, tmp)
+                        x_ok = True
+                        x_detail = f"{Path(x_bin).name} mapped {wid} and captured"
+                    except SystemExit as e:
+                        x_detail = f"mapped but blank: {str(e)[:160]}"
+                    finally:
+                        tmp.unlink(missing_ok=True)
+            finally:
+                try:
+                    xp.terminate()
+                except Exception:
+                    pass
+        gl_ok: str = "unknown"
+        gl_detail = "glxgears missing — GL path unproven"
+        if shutil.which("glxgears"):
+            gp = subprocess.Popen(["glxgears"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                    start_new_session=True)
+            try:
+                time.sleep(3.0)
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+                    tmp = Path(tf.name)
+                try:
+                    try:
+                        capture(display, tmp)
+                        gl_ok, gl_detail = "yes", "glxgears frame captured (bare Xvfb composites it here)"
+                    except SystemExit as e:
+                        estr = str(e)
+                        if "IsViewable" in estr or "compositor" in estr.lower() or "blank" in estr.lower():
+                            gl_ok = "no"
+                            gl_detail = f"glxgears blank on bare Xvfb — needs --with-wm xfwm4. {estr[:160]}"
+                        else:
+                            gl_ok = "no"
+                            gl_detail = estr[:200]
+                finally:
+                    tmp.unlink(missing_ok=True)
+            finally:
+                try:
+                    gp.terminate()
+                    gp.wait(timeout=5)
+                except Exception:
+                    try:
+                        gp.kill()
+                    except Exception:
+                        pass
+        return {"x_capturable": "yes" if x_ok else "no", "gl_capturable": gl_ok,
+                "detail": x_detail, "gl_detail": gl_detail}
+    finally:
+        try:
+            xvfb.terminate()
+            xvfb.wait(timeout=5)
+        except Exception:
+            try:
+                xvfb.kill()
+            except Exception:
+                pass
+        release_display(num)
 
 
 if __name__ == "__main__":
