@@ -6,32 +6,46 @@ vision. Your `:0` stays yours — boaz never touches it.
 
 ```bash
 boaz launch "./my-app --no-sandbox" --name vp    # headless :99+, polls for a mapped window
+boaz launch "./gl-app" --name gl --with-wm xfwm4   # GL/wgpu/SDL/GPUI: compositor so paint reaches the framebuffer
+boaz wait --name vp --for painted --timeout 120     # mapped|painted, or --window title:VideoPsalm
 boaz screenshot --name vp                         # -> shots/vp-001.png (CWD-relative)
-boaz run tests/flow.json --name vp                # xdotool script, PASS/FAIL + exit codes
-boaz record --name vp --out shots/tour.mp4        # ffmpeg x11grab, frame-verified
+boaz screenshot --name vp --window title:VideoPsalm  # target a window, not the root
+boaz run tests/flow.json --name vp                # xdotool script + assert_changed/assert_text, PASS/FAIL + exit codes
+boaz find --name vp --text "Start"                 # -> x y w h (tesseract on the live frame)
+boaz record --name vp --out shots/tour.mp4        # ffmpeg x11grab, frame-verified, reports (N frames) M/S non-blank
+boaz evidence --name vp                           # bundle shots+log+session into evidence/vp.tar.gz
 boaz log --name vp                                # app stdout when no window appears
 boaz show --name vp                               # relaunch VISIBLE — only when READY_FOR_HUMAN
 boaz kill --name vp        # verified PIDs only; --force drops stale state; --all / --sweep for orphans (exit 3 if a live process is spared)
-boaz ps                    # live sessions
-boaz doctor                # readiness check for this machine
+boaz ps --json             # live sessions (machine-readable)
+boaz doctor                # toolchain + live render smoke-test (X apps / GL apps capturable)
 ```
+
+Every command takes `--json`. `launch` takes `--env K=V` (repeatable),
+`--cwd`, `--wait-window title:`, and echoes `wm=`/`env=` in its line.
 
 Sessions are isolated: each `--name` gets its own DISPLAY (set BOAZ_SESSION_DIR to fully isolate parallel agents/CI) (`:99`–`:110`,
 probed via TCP + filesystem + abstract sockets) and its own state file, so
 parallel agents don't collide. `kill` verifies `/proc` cmdlines before
 signalling and refuses to kill strangers; `--sweep` reaps orphan Xvfb servers.
 
-Run scripts look like `tests/flow.json`:
+Run scripts look like `tests/flow.json` (key/type/click steps focus-sync first;
+assert_changed proves the UI is alive without hand-rolled PIL):
 
 ```json
 [{"action": "wait", "seconds": 0.5}, {"action": "key", "keys": "F5"},
  {"action": "type", "text": "hello"}, {"action": "click", "x": 640, "y": 400},
- {"action": "screenshot"}]
+ {"action": "screenshot", "as": "a"},
+ {"action": "wait", "seconds": 1},
+ {"action": "assert_changed", "vs": "a", "region": [1100, 50, 260, 50], "min_delta": 0.01},
+ {"action": "assert_text", "contains": "John 3:16"}]
 ```
 
 Notes: relaunching a `--name` kills its old session first; screenshots land in
-`shots/` under your current directory; captures are content-gated — a blank
-frame exits non-zero instead of lying to the agent.
+`shots/` under your current directory (also archived to `evidence/<name>/`);
+captures are content-gated — a blank frame exits non-zero with the window
+diagnostic + toolkit hint (Electron/Qt/Java/GL-compositor) and the exact
+`--with-wm xfwm4` retry instead of lying to the agent.
 
 ## Requirements (Linux)
 
