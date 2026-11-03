@@ -95,7 +95,27 @@ running untouched. Never let the human click around while the agent drives.
 
 Done when: the MP4 exists, plays, and the human confirms on the visible copy.
 
-## 4 - Hygiene (parallel-agent safe)
+## 4 - Multiscreen via session pairs
+
+One app instance can't span two DISPLAYs, so multiscreen-requiring apps
+(control + projector, e.g. VideoPsalm) are tested as a session PAIR — one
+session per display. Each `--name` owns its DISPLAY (`:99`–`:110`, lock +
+reservation isolated), so the pair never collides; `ps` shows both, `kill --all`
+reaps both. Proven by `tests/test_multiscreen.py` (different DISPLAYs, both
+capturable, driven independently). A SINGLE app that opens two windows stays
+on one screen: target with `screenshot --window title:` + region asserts.
+
+```bash
+boaz launch "<control-cmd>" --name ctrl --wait 30
+boaz launch "<projector-cmd>" --name proj --wait 30
+boaz screenshot --name ctrl            # -> shots/ctrl-NNN.png
+boaz screenshot --name proj            # -> shots/proj-NNN.png
+boaz run tests/flow.json --name ctrl   # drive control; projector keeps running untouched
+boaz ps                                # both sessions, different DISPLAYs
+boaz kill --all                        # reaps the whole pair
+```
+
+## 5 - Hygiene (parallel-agent safe)
 
 Sessions live in `~/.cache/boaz/sessions` unless `BOAZ_SESSION_DIR` overrides
 (no export needed in the common case). Each `--name` owns a DISPLAY + state

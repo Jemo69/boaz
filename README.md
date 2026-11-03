@@ -47,6 +47,23 @@ captures are content-gated — a blank frame exits non-zero with the window
 diagnostic + toolkit hint (Electron/Qt/Java/GL-compositor) and the exact
 `--with-wm xfwm4` retry instead of lying to the agent.
 
+## Multiscreen via session pairs
+
+Apps that require multiscreen (control + projector) run as a session pair —
+one session per display, never colliding (`tests/test_multiscreen.py` proves
+it: different DISPLAYs, both capturable, driven independently):
+
+```bash
+boaz launch "<control-cmd>" --name ctrl --wait 30
+boaz launch "<projector-cmd>" --name proj --wait 30
+boaz screenshot --name ctrl; boaz screenshot --name proj
+boaz run tests/flow.json --name ctrl   # projector keeps running untouched
+boaz kill --all                        # reaps the whole pair
+```
+
+A single app with two windows stays on one screen: `screenshot --window title:`
++ region asserts.
+
 ## Requirements (Linux)
 
 `Xvfb xdotool xwininfo xwd ffmpeg ffprobe scrot convert` — rootless fallback works without sudo:
