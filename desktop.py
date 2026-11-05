@@ -433,13 +433,18 @@ def wm_argv(wm: str) -> list[str]:
 
 
 def start_wm(display: str, wm: str, log_path: Path | None = None):
-    """Start a WM/compositor on DISPLAY. Returns the Popen (caller tracks pid)."""
+    """Start a WM/compositor on DISPLAY. Returns the Popen (caller tracks pid).
+
+    The WM gets its OWN log (<session>-wm.log): sharing the app log buried
+    app stdout under xfwm4/llvmpipe lines (issue #6) and made asset-path vs
+    GL failures indistinguishable."""
     env = display_env(display)
     out = subprocess.DEVNULL
     if log_path is not None:
         try:
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            out = open(log_path, "ab")
+            wm_log = log_path.with_name(log_path.stem + "-wm" + log_path.suffix)
+            out = open(wm_log, "ab")
         except OSError:
             out = subprocess.DEVNULL
     try:
@@ -551,7 +556,7 @@ def ensure_focus(display: str, selector: str | None = None) -> str:
     return got
 
 
-def wait_for_window(display: str, timeout: float = 30.0, selector: str | None = None) -> str:
+def wait_for_window(display: str, timeout: float = 30.0, selector: str | None = None, ignore: set[str] | None = None) -> str:
     """Poll until a non-root client window maps. Replaces the old blind sleep.
 
     selector follows --window syntax (title:Sub | id:... | first)."""
@@ -576,6 +581,8 @@ def wait_for_window(display: str, timeout: float = 30.0, selector: str | None = 
         r = _cap_run(["xdotool", "search", "--onlyvisible", ".*"],
                            env=env, capture_output=True, text=True)
         for wid in r.stdout.split():
+            if ignore and wid in ignore:
+                continue
             q = _cap_run(["xwininfo", "-id", wid], env=env,
                                capture_output=True, text=True)
             if "Map State: IsViewable" in q.stdout and "root window" not in q.stdout:
@@ -672,14 +679,29 @@ def _toolkit_hint(display: str) -> str:
     return ""
 
 
-def _variance_ok(path: Path) -> bool:
+def _variance_ok(path: Path, floor: float = 1.5) -> bool:
     """Reject flat frames (dead app, unmapped window). Content gate: exit 0 must mean pixels."""
     try:
         from PIL import Image, ImageStat
         small = Image.open(path).convert("L").resize((160, 100))
-        return (ImageStat.Stat(small).stddev[0] or 0) > 1.5
+        return (ImageStat.Stat(small).stddev[0] or 0) >= floor
     except Exception:
         return False  # undecodable frames never pass the gate
+
+
+def painted_ok(path: Path) -> bool:
+    """Strict gate for `wait --for painted`: whole frame AND center must vary,
+    so a bare WM title-bar on a black root never reports painted (issue #5)."""
+    try:
+        from PIL import Image, ImageStat
+        img = Image.open(path).convert("L").resize((160, 100))
+        if (ImageStat.Stat(img).stddev[0] or 0) < 3.0:
+            return False
+        w, h = img.size
+        cx = img.crop((w // 4, h // 4, 3 * w // 4, 3 * h // 4))
+        return (ImageStat.Stat(cx).stddev[0] or 0) >= 3.0
+    except Exception:
+        return False
 
 
 def frame_delta(a: Path, b: Path, region: list[int] | None = None) -> float:
@@ -702,7 +724,7 @@ def frame_delta(a: Path, b: Path, region: list[int] | None = None) -> float:
 def ocr_text(image: Path, region: list[int] | None = None) -> str:
     """OCR a frame (or region) via tesseract TSV. Raises SystemExit with install hint."""
     if not shutil.which("tesseract"):
-        raise SystemExit("Missing tesseract. Install: sudo apt install tesseract-ocr")
+        raise SystemExit("Missing tesseract (sudo apt install tesseract-ocr). Fallback: assert_changed region diffs need no OCR.")
     from PIL import Image
     import tempfile
     img = Image.open(image).convert("L")
@@ -734,7 +756,7 @@ def ocr_text(image: Path, region: list[int] | None = None) -> str:
 def ocr_find(image: Path, text: str) -> dict | None:
     """Find text on a frame. Returns {x,y,w,h} of the first match, else None."""
     if not shutil.which("tesseract"):
-        raise SystemExit("Missing tesseract. Install: sudo apt install tesseract-ocr")
+        raise SystemExit("Missing tesseract (sudo apt install tesseract-ocr). Fallback: assert_changed region diffs need no OCR.")
     import tempfile
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
         tmp = Path(tf.name)

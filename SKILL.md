@@ -27,8 +27,25 @@ Done when: help lists all twelve commands and doctor shows X apps capturable.
 
 ## 2 - Headless test loop (default)
 
+Isolate per task, then drive (perez example):
+
 ```bash
-boaz launch "<cmd>" --name app          # runs in YOUR $PWD; --cwd overrides. Echoes cwd= in the launch line.
+export BOAZ_SESSION_DIR=~/.cache/boaz/sessions-<task>  # isolate parallel agents
+boaz doctor; boaz kill --all --sweep
+boaz launch "/abs/target/debug/perez-rs" --name t --with-wm auto --cwd /home/jemo/projects/video-psalm-reverse-eng-v-2 --env LIBGL_ALWAYS_SOFTWARE=1
+boaz wait --name t --for painted --timeout 120
+boaz screenshot --name t --json  # use returned absolute path (BOAZ_SHOTS overrides shot dir)
+boaz run /tmp/flow.json --name t # file, never inline JSON on the CLI (or --inline '[...]')
+boaz record --name t --out /abs/shots/<name>.mp4
+boaz evidence --name t  # attach evidence/*.tar.gz to the PR before READY_FOR_HUMAN
+```
+
+Never claim second-monitor/video OK from boaz — mark needs-human-hardware (single-display only; `doctor` says so explicitly). `tests/boaz-flow.json` covers the perez loop: click Play-it direct → assert_changed, Display-2 pick → RandR log hint, open video → missing-file guard.
+
+General form:
+
+```bash
+boaz launch "<cmd>" --name app          # runs in YOUR $PWD; --cwd overrides. Echoes cmd=/abs cwd= shot_dir= in the launch line.
 boaz launch "<cmd>" --name slow --timeout 120 --cwd /path/to/repo   # slow cold-starts
 boaz launch "<cmd>" --name gl --with-wm xfwm4   # GL/wgpu/SDL/GPUI: compositor so the GL surface composites (auto: --with-wm auto)
 boaz launch "<cmd>" --name app --env VP_KEY=1 --env LIBGL_ALWAYS_SOFTWARE=1   # repeatable, echoed in launch line

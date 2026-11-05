@@ -36,13 +36,15 @@ app = typer.Typer(help="Boaz — headless desktop tester. Agent sees the app, yo
 
 
 def _shots_dir() -> Path:
-    d = Path("shots")  # CWD-relative by design: agents run boaz from the project root
+    d = Path(os.environ.get("BOAZ_SHOTS", "shots")).expanduser()
+    if not d.is_absolute():
+        d = (Path.cwd() / d).resolve()
     try:
-        d.mkdir(exist_ok=True)
+        d.mkdir(parents=True, exist_ok=True)
     except OSError as e:
-        raise SystemExit(f"cannot write shots dir ./shots: {e}")
+        raise SystemExit(f"cannot write shots dir {d}: {e}")
     if not d.is_dir():
-        raise SystemExit("./shots exists as a file — remove it or run boaz from another directory")
+        raise SystemExit(f"{d} exists as a file — remove it or set BOAZ_SHOTS elsewhere")
     return d
 
 
@@ -67,9 +69,19 @@ def _shot(name: str, out: str | None = None) -> str:
     stem = safe_stem(name)
     if out is None:
         out = str(_next_shot(stem))
+    else:
+        p0 = Path(out).expanduser()
+        if not p0.is_absolute():
+            p0 = (Path.cwd() / p0).resolve()
+        out = str(p0)
+        try:
+            p0.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            raise SystemExit(f"cannot write {out}: {e}")
     p = str(capture(st["display"], Path(out)))
-    _archive_evidence(name, Path(p))
-    return p
+    ap = str(Path(p).resolve())
+    _archive_evidence(name, Path(ap))
+    return ap
 
 
 def _jprint(obj: dict) -> None:
@@ -130,7 +142,7 @@ def launch(
     cwd: str = typer.Option(None, help="Working dir for the app (default: your current $PWD)"),
     width: int = typer.Option(WIDTH, help="Headless screen width"),
     height: int = typer.Option(HEIGHT, help="Headless screen height"),
-    with_wm: str = typer.Option(None, "--with-wm", help="WM/compositor: xfwm4|picom|compton|openbox|mutter|auto|none"),
+    with_wm: str = typer.Option("auto", "--with-wm", help="WM/compositor: xfwm4|picom|compton|openbox|mutter|auto|none (default auto: probe Xvfb+compositor before mapped)"),
     wait_window: str = typer.Option(None, "--wait-window", help="Wait for window title:Sub instead of any window"),
     env: List[str] = typer.Option([], "--env", help="Env passthrough K=V (repeatable, no shell quoting needed)"),
     json_out: bool = typer.Option(False, "--json", help="Machine-readable output"),
@@ -145,14 +157,70 @@ def launch(
     run_cwd = str(Path(cwd).expanduser().resolve()) if cwd else os.getcwd()
     if not Path(run_cwd).is_dir():
         raise SystemExit(f"bad --cwd={run_cwd}: not a directory")
+    # Issue #1: agents guess repo layouts (gpui-app/app/src vs app/src). List cwd so a
+    # wrong-cwd launch is visible in the first line, not after a blank capture.
+    try:
+        _entries = sorted(p.name for p in Path(run_cwd).iterdir())[:12]
+        print(f"cwd_ls={','.join(_entries) or '(empty)'}")
+    except OSError:
+        pass
+    # Issue #3: relative ./target/... cmd + --cwd footgun. Old behavior rejected it;
+    # now auto-resolve against the INVOKING cwd (where the relative path was typed)
+    # and use the absolute path, so the launch works instead of erroring.
+    _first = (cmd.strip().split() or [""])[0]
+    _rest = cmd.strip()[len(_first):] if _first else ""
+    if _first.startswith(("./", "../")) or (not _first.startswith(("/", "~")) and "/" in _first):
+        _invoked = Path(_first).expanduser()
+        if not _invoked.is_absolute():
+            _invoked = (Path.cwd() / _invoked).resolve()
+        if Path(run_cwd).resolve() != Path.cwd().resolve():
+            if _invoked.exists():
+                cmd = str(_invoked) + _rest
+                _first = str(_invoked)
+                print(f"cwd_note=relative cmd resolved against invoking cwd -> {_first}")
+            else:
+                raise SystemExit(
+                    f"relative cmd {_first!r} with --cwd={run_cwd} resolves against the wrong dir. "
+                    f"Pass an absolute cmd (e.g. \"{Path.cwd() / _first}\") or drop --cwd.")
+    # Issue #2: Wayland-first toolkits panic on WSLg (gpui UnsupportedVersion) when
+    # WAYLAND_DISPLAY leaks through. display_env() already strips it for the child;
+    # say so loudly so the agent doesn't burn a round re-passing --env WAYLAND_DISPLAY=.
+    if os.environ.get("WAYLAND_DISPLAY"):
+        print("wayland_note=WAYLAND_DISPLAY was set in your shell; boaz strips it for the app (no --env needed)")
+    print(f"cmd={Path(_first).expanduser().resolve() if _first.startswith(('/', '~', '.')) else _first} cwd={run_cwd} shot_dir={_shots_dir().resolve()}")
     for dim, val in (("width", width), ("height", height)):
         if not 320 <= val <= 7680:
             raise SystemExit(f"bad {dim}={val}: want 320-7680 (a real screen size)")
     extra_env = _parse_env(env)
-    wm_bin = pick_wm(with_wm) if with_wm else None
+    wm_bin = pick_wm(with_wm)  # default auto: None only when no compositor installed
+    if with_wm in (None, "auto") and wm_bin is None:
+        rprint("[yellow]compositor-required: no WM/compositor found (want xfwm4) — GPUI/wgpu/SDL will capture blank. Install xfwm4 or pass --with-wm none to proceed bare.[/]")
     kept = _kill([name], sweep=False, force=False, quiet=True)
     if name in kept:
         raise SystemExit(f"session '{name}' kept a live unverified process — refusing to overwrite it. Use --force with kill first.")
+    # Issue #9: stale sessions (probe2, zz9, ...) accumulate and collide on :99.
+    # Prune dead sessions (Xvfb gone) on every launch so ps stays truthful.
+    for _p in sessions_dir().glob("*.json"):
+        try:
+            _st = json.loads(_p.read_text())
+        except (OSError, ValueError, RecursionError):
+            continue
+        if not isinstance(_st, dict):
+            continue
+        _x = _st.get("xvfb")
+        if isinstance(_x, int) and not proc_cmdline(_x):
+            try:
+                _p.unlink()
+                rprint(f"[dim]pruned stale session {_p.stem} (Xvfb {_x} gone).[/]")
+            except OSError:
+                pass
+    # Issue #8: control+projector apps (VideoPsalm/perez) need a session PAIR — one
+    # screen can only ever prove half. Warn at launch, don't let a green capture
+    # imply the projector was verified.
+    if any(k in cmd.lower() for k in ("video", "psalm", "perez", "projector", "control")):
+        rprint("[yellow]multiscreen hint: control+projector apps need a session PAIR "
+                "(launch '<control-cmd>' --name ctrl + '<projector-cmd>' --name proj). "
+                "One capture can only prove half.[/]")
     num = alloc_display()
     display = f":{num}"
     xvfb_path = xvfb_bin()
@@ -206,6 +274,12 @@ def launch(
     try:
         with lf:
             app_token = uuid.uuid4().hex
+            # Baseline: WM/compositor windows already mapped must not count as the app.
+            try:
+                from desktop import list_windows as _lw
+                _baseline = {w["id"] for w in _lw(display)}
+            except Exception:
+                _baseline = set()
             app_env = dict(display_env(display), BOAZ_APP_TOKEN=app_token)
             app_env.update(extra_env)
             proc = subprocess.Popen(cmd, shell=True, env=app_env, cwd=run_cwd,
@@ -227,7 +301,8 @@ def launch(
         drop_session(name)
         raise
     try:
-        wid = wait_for_window(display, timeout=wait, selector=wait_window)
+        wid = wait_for_window(display, timeout=wait, selector=wait_window,
+                              ignore=None if wait_window else _baseline)
     except SystemExit:
         from desktop import window_state as _ws
         rprint(f"[yellow]launched in {run_cwd} but no window mapped after {wait}s on {display}.[/]")
@@ -275,12 +350,21 @@ def wait(
             return
         rprint(f"[bold green]mapped[/] window={wid} display={st['display']}")
         return
-    # painted: mapped AND a non-blank capture succeeds
+    # painted: mapped AND a STRICT non-blank capture succeeds (issue #5: the old
+    # gate used the lenient root variance, so a bare title-bar on black reported
+    # painted. Now requires center-frame variance too.)
     deadline = time.time() + timeout
     last = ""
     while time.time() < deadline:
         try:
             shot = _shot(name)
+            from desktop import painted_ok as _pok
+            if not _pok(Path(shot)):
+                last = (f"frame {shot} varies at the edges only (chrome on black?) "
+                        f"— viewable != rendering; see `boaz log --name {name}`")
+                Path(shot).unlink(missing_ok=True)
+                time.sleep(2.0)
+                continue
             if json_out:
                 _jprint({"session": name, "display": st["display"], "for": for_, "shot": shot})
                 return
@@ -320,8 +404,9 @@ def screenshot(
 
 @app.command()
 def run(
-    script: str = typer.Argument(..., help="JSON steps file, e.g. tests/flow.json"),
+    script: str = typer.Argument(..., help="JSON steps file, e.g. tests/flow.json (or inline JSON with --inline)"),
     name: str = typer.Option("app", help="Session name"),
+    inline: bool = typer.Option(False, "--inline", help="Treat SCRIPT as inline JSON steps instead of a file path"),
     window: str = typer.Option(None, "--window", help="Focus target title:Sub|id:...|first"),
     json_out: bool = typer.Option(False, "--json", help="Machine-readable output"),
 ) -> None:
@@ -329,24 +414,30 @@ def run(
 
     x,y are root-display coordinates as seen in screenshots (window sits at +0+20 under root).
     """
-    ok = _run(script, name, window=window, json_out=json_out)
+    ok = _run(script, name, window=window, json_out=json_out, inline=inline)
     raise typer.Exit(0 if ok else 1)
 
 
-def _run(script: str, name: str, window: str | None = None, json_out: bool = False) -> bool:
+def _run(script: str, name: str, window: str | None = None, json_out: bool = False, inline: bool = False) -> bool:
     _EXAMPLES = {"wait": '{"action":"wait","seconds":2}', "key": '{"action":"key","keys":"Escape"}', "type": '{"action":"type","text":"hi"}', "click": '{"action":"click","x":640,"y":400}', "scroll": '{"action":"scroll","x":640,"y":400,"clicks":3,"dir":"down"}', "drag": '{"action":"drag","x1":100,"y1":200,"x2":300,"y2":400}', "screenshot": '{"action":"screenshot","as":"a"}', "assert_changed": '{"action":"assert_changed","vs":"a","region":[100,100,200,150],"min_delta":0.01}', "assert_text": '{"action":"assert_text","contains":"John 3:16"}'}
     _require_linux("run")
     need_bins("xdotool")
     st = need_session(name)
-    try:
-        raw = Path(script).read_bytes()
-        if len(raw) > (1 << 20):
-            raise SystemExit(f"bad script {script}: file too large (>1MB)")
-        steps = json.loads(raw.decode(errors="replace"))
-    except OSError as e:
-        raise SystemExit(f"bad script {script}: {e}")
-    except (ValueError, RecursionError) as e:
-        raise SystemExit(f"bad script {script}: invalid JSON: {e}")
+    if inline or (script.lstrip().startswith("[") and not Path(script).exists()):
+        try:
+            steps = json.loads(script)
+        except (ValueError, RecursionError) as e:
+            raise SystemExit(f"bad --inline JSON: {e}")
+    else:
+        try:
+            raw = Path(script).read_bytes()
+            if len(raw) > (1 << 20):
+                raise SystemExit(f"bad script {script}: file too large (>1MB)")
+            steps = json.loads(raw.decode(errors="replace"))
+        except OSError as e:
+            raise SystemExit(f"bad script {script}: {e}")
+        except (ValueError, RecursionError) as e:
+            raise SystemExit(f"bad script {script}: invalid JSON: {e}")
     if not isinstance(steps, list):
         raise SystemExit(f"bad script {script}: top level must be a JSON list of steps")
     env = display_env(st["display"])
@@ -534,6 +625,7 @@ def record(
         except Exception:
             pass
     out = out or str(_shots_dir() / f"{safe_stem(name)}.mp4")
+    out = str((Path(out).expanduser() if Path(out).is_absolute() else (Path.cwd() / out)).resolve())
     if Path(out).is_dir():
         raise SystemExit(f"cannot write {out}: is a directory")
     if not (0 < seconds <= 3600):
@@ -557,6 +649,18 @@ def record(
     except OSError as e:
         raise SystemExit(f"cannot open ffmpeg log {errlog}: {e}")
     with ef:
+        # Early-blank gate: refuse after ~2s static instead of wasting 5s of ffmpeg.
+        try:
+            import tempfile as _tf
+            with _tf.NamedTemporaryFile(suffix=".png", delete=False) as _t:
+                _probe = Path(_t.name)
+            try:
+                capture(st["display"], _probe)
+            finally:
+                _probe.unlink(missing_ok=True)
+        except SystemExit as e:
+            tail = errlog.read_text(errors="replace")[-300:] if errlog.exists() else ""
+            raise SystemExit(f"record refused (blank at start, no 5s wasted): {e} {tail.strip()[-200:]}")
         ff_cmd = ["ffmpeg", "-y", "-f", "x11grab", "-draw_mouse", "0", "-r", "10"]
         if st.get("_grab_size"):
             ff_cmd += ["-video_size", st["_grab_size"]]
@@ -638,6 +742,7 @@ def record(
     if flat:
         _fail(f"record is blank (no pixel variance — {n} frames, {nonblank} non-blank) — was the app running?")
     os.replace(tmp_out, out)
+    out = str(Path(out).resolve())
     _archive_evidence(name, Path(out))
     if json_out:
         _jprint({"session": name, "path": out, "frames": int(n) if str(n).strip().isdigit() else n,
@@ -705,7 +810,7 @@ def evidence(
                     members.append(f"evidence/{f.name}")
             except OSError:
                 pass
-        for f in (sessions_dir() / f"{stem}.json", sessions_dir() / f"{stem}.log"):
+        for f in (sessions_dir() / f"{stem}.json", sessions_dir() / f"{stem}.log", sessions_dir() / f"{stem}-wm.log"):
             try:
                 if f.is_file():
                     tf.add(f, arcname=f"session/{f.name}")
@@ -1039,6 +1144,8 @@ def doctor(json_out: bool = typer.Option(False, "--json", help="Machine-readable
         ("scrot", shutil.which("scrot"), "sudo apt install scrot"),
         ("convert", shutil.which("convert"), "sudo apt install imagemagick"),
         ("tesseract", shutil.which("tesseract"), "sudo apt install tesseract-ocr (find/assert_text need it)"),
+        ("mpv (video check)", shutil.which("mpv"), "sudo apt install mpv (video-playback proof needs it)"),
+        ("xrandr/RandR", shutil.which("xrandr"), "sudo apt install x11-xserver-utils (multi-display proof needs it)"),
         ("xfwm4 (compositor)", shutil.which("xfwm4"), "sudo apt install xfwm4 (GL apps need a compositor)"),
         ("glxgears (GL probe)", shutil.which("glxgears"), "sudo apt install mesa-utils (doctor GL smoke-test)"),
         ("/dev/dri (GPU)", str(Path("/dev/dri/card0").exists()), "rootless sandboxes use Lavapipe software GL"),
@@ -1056,6 +1163,7 @@ def doctor(json_out: bool = typer.Option(False, "--json", help="Machine-readable
         return
     for label, have, hint in rows:
         rprint(f"{'✅' if have else '❌'} {label}: {have if have else 'MISSING — ' + hint}")
+    rprint("[dim]single-display only: boaz cannot prove Display-2/projector or audible video-playback — mark needs-human-hardware.[/]")
 
 
 def _doctor_render_probe() -> dict:
