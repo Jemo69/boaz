@@ -679,12 +679,62 @@ def _toolkit_hint(display: str) -> str:
     return ""
 
 
+THUMB_W, THUMB_H = 160, 100  # gate resolution: 16KiB gray buffer, not 1-8MiB PIL frames
+
+
+def _gray_thumb(path: Path, region: list[int] | None = None,
+                w: int = THUMB_W, h: int = THUMB_H) -> bytes | None:
+    """Decode path to a w*h gray8 thumbnail via ffmpeg rawvideo (no PIL heap).
+    Region [x,y,rw,rh] is cropped at decode time, so a 200x150 assert touches
+    ~16KiB, never two full 1280x800 PIL frames + a diff frame (~8MiB).
+    Returns None when ffmpeg is missing/undecodable (callers fall back to PIL)."""
+    try:
+        vf = "format=gray"
+        if region:
+            x, y, rw, rh = (int(v) for v in region)
+            if rw <= 0 or rh <= 0:
+                raise ValueError(f"bad region {region}: want positive w/h")
+            vf = f"crop={rw}:{rh}:{max(x, 0)}:{max(y, 0)}," + vf
+        vf += f",scale={w}:{h}:flags=fast_bilinear"
+        r = subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(path),
+                            "-vf", vf, "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                           capture_output=True, timeout=15)
+        if r.returncode == 0 and len(r.stdout) == w * h:
+            return r.stdout
+        return None
+    except Exception:
+        return None
+
+
+def _mean_stddev(buf: bytes) -> tuple[float, float]:
+    n = len(buf)
+    if not n:
+        return 0.0, 0.0
+    mean = sum(buf) / n
+    var = sum((b - mean) ** 2 for b in buf) / n
+    return mean, var ** 0.5
+
+
+def _pil_thumb_stat(path: Path, floor: float, center_only: bool = False) -> bool:
+    """PIL fallback for the variance gates (ffmpeg missing). Slower, more heap."""
+    from PIL import Image, ImageStat
+    small = Image.open(path).convert("L").resize((THUMB_W, THUMB_H))
+    if center_only:
+        w, h = small.size
+        small = small.crop((w // 4, h // 4, 3 * w // 4, 3 * h // 4))
+    return (ImageStat.Stat(small).stddev[0] or 0) >= floor
+
+
 def _variance_ok(path: Path, floor: float = 1.5) -> bool:
     """Reject flat frames (dead app, unmapped window). Content gate: exit 0 must mean pixels."""
+    raw = _gray_thumb(path)
+    if raw is not None:
+        try:
+            return _mean_stddev(raw)[1] >= floor
+        except Exception:
+            return False
     try:
-        from PIL import Image, ImageStat
-        small = Image.open(path).convert("L").resize((160, 100))
-        return (ImageStat.Stat(small).stddev[0] or 0) >= floor
+        return _pil_thumb_stat(path, floor)
     except Exception:
         return False  # undecodable frames never pass the gate
 
@@ -692,9 +742,23 @@ def _variance_ok(path: Path, floor: float = 1.5) -> bool:
 def painted_ok(path: Path) -> bool:
     """Strict gate for `wait --for painted`: whole frame AND center must vary,
     so a bare WM title-bar on a black root never reports painted (issue #5)."""
+    raw = _gray_thumb(path)
+    if raw is not None:
+        try:
+            _, sd = _mean_stddev(raw)
+            if sd < 3.0:
+                return False
+            # center half of the 160x100 thumb = middle 80x50 bytes, no second decode
+            w, h = THUMB_W, THUMB_H
+            cx = bytearray()
+            for row in range(h // 4, 3 * h // 4):
+                cx += raw[row * w + w // 4: row * w + 3 * w // 4]
+            return _mean_stddev(bytes(cx))[1] >= 3.0
+        except Exception:
+            return False
     try:
         from PIL import Image, ImageStat
-        img = Image.open(path).convert("L").resize((160, 100))
+        img = Image.open(path).convert("L").resize((THUMB_W, THUMB_H))
         if (ImageStat.Stat(img).stddev[0] or 0) < 3.0:
             return False
         w, h = img.size
@@ -706,6 +770,9 @@ def painted_ok(path: Path) -> bool:
 
 def frame_delta(a: Path, b: Path, region: list[int] | None = None) -> float:
     """Mean absolute per-pixel difference in [0,1] for region [x,y,w,h] (or full frame)."""
+    ra, rb = _gray_thumb(a, region), _gray_thumb(b, region)
+    if ra is not None and rb is not None and len(ra) == len(rb) and ra:
+        return sum(abs(x - y) for x, y in zip(ra, rb)) / (len(ra) * 255.0)
     from PIL import Image, ImageChops, ImageStat
     ia = Image.open(a).convert("L")
     ib = Image.open(b).convert("L")

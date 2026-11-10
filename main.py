@@ -110,15 +110,29 @@ def _evidence_dir(name: str) -> Path:
 
 
 def _archive_evidence(name: str, path: Path) -> None:
-    """Copy a capture/record into the per-session evidence dir (proof survives /tmp)."""
+    """Hardlink (fallback copy) a capture/record into the per-session evidence dir.
+    Same bytes, zero extra disk + one page-cache entry instead of two."""
     try:
         if not path.is_file():
             return
         dest = _evidence_dir(name) / path.name
         if path.resolve() == dest.resolve():
             return
-        import shutil as _sh
-        _sh.copy2(path, dest)
+        if dest.exists():
+            try:
+                if dest.stat().st_ino == path.stat().st_ino:
+                    return
+            except OSError:
+                pass
+            try:
+                dest.unlink()
+            except OSError:
+                return
+        try:
+            os.link(path, dest)  # same filesystem: no bytes copied, no 2x page cache
+        except OSError:
+            import shutil as _sh
+            _sh.copy2(path, dest)
     except Exception:
         pass
 
@@ -724,17 +738,19 @@ def record(
     sampled = 0
     for pos in (0.0, total / 2, max(total - 0.2, 0.0)):
         try:
-            fr = subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", str(round(pos, 2)),
-                                   "-i", tmp_out, "-frames:v", "1", "-f", "image2pipe",
-                                   "-vcodec", "png", "-"],
+            # 16KiB gray thumb straight from ffmpeg: no PNG bytes + PIL frame in heap.
+            gr = subprocess.run(["ffmpeg", "-y", "-v", "error", "-ss", str(round(pos, 2)),
+                                   "-i", tmp_out, "-frames:v", "1",
+                                   "-vf", "format=gray,scale=160:100:flags=fast_bilinear",
+                                   "-f", "rawvideo", "-pix_fmt", "gray", "-"],
                                   capture_output=True, timeout=15)
-        except subprocess.TimeoutExpired:
-            continue
-        try:
-            from PIL import Image, ImageStat
-            import io as _io
+            raw = gr.stdout if gr.returncode == 0 else b""
+            if len(raw) != 160 * 100:
+                continue
             sampled += 1
-            if (ImageStat.Stat(Image.open(_io.BytesIO(fr.stdout)).convert("L").resize((160, 100))).stddev[0] or 0) > 1.5:
+            mean = sum(raw) / len(raw)
+            var = sum((b - mean) ** 2 for b in raw) / len(raw)
+            if var ** 0.5 > 1.5:
                 flat = False
                 nonblank += 1
         except Exception:
