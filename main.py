@@ -25,7 +25,7 @@ from desktop import (
     FIRST_DISPLAY, HEIGHT, LAST_DISPLAY, WIDTH, XVFB_ARGV0,
     alloc_display, capture, confirm_display, display_env, display_taken, drop_session, load,
     need_session, proc_cmdline, proc_environ, proc_stat_starttime, release_display, safe_stem, save, session_path, sessions_dir, verified_kill, _read_json,
-    wait_for_window, need_bins, xvfb_bin, GLOBAL_RESERVE,
+    wait_for_window, need_bins, xvfb_bin, GLOBAL_RESERVE, session_ttl, session_idle_seconds,
     pick_wm, start_wm, resolve_window, ensure_focus, list_windows, frame_delta, ocr_text, ocr_find, count_nonblank,
 )
 
@@ -64,8 +64,30 @@ def _next_shot(path_stem: str, suffix: str = "") -> Path:
     return _shots_dir() / f"{path_stem}{suffix}-{max(nums, default=0) + 1:03d}.png"
 
 
-def _shot(name: str, out: str | None = None) -> str:
+def _use(name: str) -> dict:
+    """need_session + TTL: a launched session idle longer than BOAZ_TTL
+    (default 60s) is killed on touch. Active use refreshes last_used, so long
+    runs survive; abandoned sessions die. Sessions predating timestamps are exempt."""
     st = need_session(name)
+    ttl = session_ttl()
+    idle = session_idle_seconds(st)
+    if ttl > 0 and idle is not None and idle > ttl:
+        _kill([name], sweep=False, force=False, quiet=True)
+        drop_session(name)  # expired means gone, even if a stranger survived unverified
+        raise SystemExit(
+            f"session '{name}' expired after {ttl:g}s idle — killed. "
+            f"Relaunch: boaz launch --name {name} '<cmd>'. (BOAZ_TTL=0 disables.)")
+    if "created_at" in st:
+        st["last_used"] = time.time()
+        try:
+            save(name, st)
+        except SystemExit:
+            pass
+    return st
+
+
+def _shot(name: str, out: str | None = None) -> str:
+    st = _use(name)
     stem = safe_stem(name)
     if out is None:
         out = str(_next_shot(stem))
@@ -302,6 +324,7 @@ def launch(
         from desktop import boot_id as _boot
         save(name, {"xvfb": xvfb.pid, "xvfb_starttime": proc_stat_starttime(xvfb.pid),
                     "app": proc.pid, "app_starttime": proc_stat_starttime(proc.pid),
+                    "created_at": time.time(), "last_used": time.time(),
                     "boot_id": _boot(), "app_token": app_token,
                     "cmd": cmd, "display": display, "name": name, "cwd": run_cwd,
                     "wm": (wm_proc.pid if wm_proc else None),
@@ -351,7 +374,7 @@ def wait(
         raise SystemExit(f"bad --for={for_!r}: want mapped|painted")
     if not 0 < timeout <= 3600:
         raise SystemExit(f"bad --timeout={timeout}: want 0-3600")
-    st = need_session(name)
+    st = _use(name)
     from desktop import window_state as _ws
     if for_ == "mapped":
         try:
@@ -400,7 +423,7 @@ def screenshot(
 ) -> None:
     """Capture the headless display to PNG. Agent reads this with vision."""
     _require_linux("screenshot")
-    st = need_session(name)
+    st = _use(name)
     stem = safe_stem(name)
     wid = _resolve_capture_wid(st["display"], window) if window else None
     if window and not wid:
@@ -436,7 +459,7 @@ def _run(script: str, name: str, window: str | None = None, json_out: bool = Fal
     _EXAMPLES = {"wait": '{"action":"wait","seconds":2}', "key": '{"action":"key","keys":"Escape"}', "type": '{"action":"type","text":"hi"}', "click": '{"action":"click","x":640,"y":400}', "scroll": '{"action":"scroll","x":640,"y":400,"clicks":3,"dir":"down"}', "drag": '{"action":"drag","x1":100,"y1":200,"x2":300,"y2":400}', "screenshot": '{"action":"screenshot","as":"a"}', "assert_changed": '{"action":"assert_changed","vs":"a","region":[100,100,200,150],"min_delta":0.01}', "assert_text": '{"action":"assert_text","contains":"John 3:16"}'}
     _require_linux("run")
     need_bins("xdotool")
-    st = need_session(name)
+    st = _use(name)
     if inline or (script.lstrip().startswith("[") and not Path(script).exists()):
         try:
             steps = json.loads(script)
@@ -620,7 +643,7 @@ def record(
     """Record the headless display via ffmpeg x11grab. No window on your screen."""
     _require_linux("record")
     need_bins("ffmpeg", "ffprobe")
-    st = need_session(name)
+    st = _use(name)
     grab = st["display"]
     if window:
         wid = _resolve_capture_wid(st["display"], window)
@@ -776,7 +799,7 @@ def find(
 ) -> None:
     """Locate text on the live headless frame (tesseract). Prints x y w h."""
     _require_linux("find")
-    st = need_session(name)
+    st = _use(name)
     wid = _resolve_capture_wid(st["display"], window) if window else None
     import tempfile
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
@@ -1132,10 +1155,15 @@ def ps(all: bool = typer.Option(False, help="Show dead/stale sessions too"),
                            "pid": st.get("app"), "alive": False, "cmd": st.get("cmd")})
             found = True
             continue
+        idle = session_idle_seconds(st, time.time())
+        ttl = session_ttl()
         rows.append({"name": st.get("name"), "display": st.get("display"),
-                       "pid": st.get("app"), "alive": alive, "cmd": st.get("cmd")})
+                       "pid": st.get("app"), "alive": alive, "cmd": st.get("cmd"),
+                       "idle_seconds": round(idle) if idle is not None else None,
+                       "ttl_seconds": ttl})
         if not json_out:
-            rprint(f"{'🟢' if alive else '⚫ gone'} {st.get('name')}  {st.get('display')}  pid={st.get('app')}  {st.get('cmd')}")
+            age = "" if idle is None else f"  idle={idle:.0f}s/{ttl:g}s"
+            rprint(f"{'🟢' if alive else '⚫ gone'} {st.get('name')}  {st.get('display')}  pid={st.get('app')}{age}  {st.get('cmd')}")
         found = True
     if json_out:
         _jprint({"sessions": rows})

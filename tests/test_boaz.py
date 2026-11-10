@@ -509,3 +509,48 @@ def test_record_keeps_user_file_on_valid_session_blank(names):
         (sessions_dir() / f"{n}.json").unlink(missing_ok=True)
         xvfb.terminate(); xvfb.wait()
         keep.unlink(missing_ok=True)
+
+
+@needs_linux
+@needs_xlogo
+def test_session_dies_after_ttl_idle(names):
+    """A launched session idle past BOAZ_TTL is killed on next touch (backdated, no sleep races)."""
+    import time as _t
+    n = tag("t-ttl"); names.append(n)
+    os.environ["BOAZ_TTL"] = "30"
+    try:
+        r = boaz("launch", str(XLOGO), "--name", n, "--wait", "15")
+        assert r.returncode == 0, r.stdout + r.stderr
+        st = session(n)
+        assert "created_at" in st, "launch must stamp TTL fields"
+        st["last_used"] = _t.time() - 60
+        (sessions_dir() / f"{n}.json").write_text(json.dumps(st))
+        r = boaz("screenshot", "--name", n)
+        assert r.returncode != 0, "expired session drove a display:\n" + r.stdout
+        assert "expired" in (r.stdout + r.stderr).lower()
+        assert session(n) == {}, "expired session file must be gone"
+        _t.sleep(0.5)
+        assert not Path(f"/proc/{st['app']}").exists(), "app must be dead"
+        assert not Path(f"/proc/{st['xvfb']}").exists(), "Xvfb must be dead"
+    finally:
+        del os.environ["BOAZ_TTL"]
+
+
+@needs_linux
+@needs_xlogo
+def test_session_active_use_refreshes_ttl(names):
+    """Touching a session before expiry resets the idle clock — long runs survive."""
+    import time as _t
+    n = tag("t-ttlrefresh"); names.append(n)
+    os.environ["BOAZ_TTL"] = "30"
+    try:
+        r = boaz("launch", str(XLOGO), "--name", n, "--wait", "15")
+        assert r.returncode == 0, r.stdout + r.stderr
+        st = session(n)
+        st["last_used"] = _t.time() - 10
+        (sessions_dir() / f"{n}.json").write_text(json.dumps(st))
+        r = boaz("screenshot", "--name", n)
+        assert r.returncode == 0, "use before expiry must survive:\n" + r.stdout + r.stderr
+        assert session(n)["last_used"] > st["last_used"], "touch must refresh the clock"
+    finally:
+        del os.environ["BOAZ_TTL"]

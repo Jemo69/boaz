@@ -29,6 +29,12 @@ probed via TCP + filesystem + abstract sockets) and its own state file, so
 parallel agents don't collide. `kill` verifies `/proc` cmdlines before
 signalling and refuses to kill strangers; `--sweep` reaps orphan Xvfb servers.
 
+Sessions die after 60s idle: the next `screenshot`/`run`/`record`/`find`/`wait`
+on a session untouched for over `BOAZ_TTL` seconds (default 60, `0` disables)
+kills its processes, drops the session, and tells you to relaunch. Active use
+refreshes the clock, so long runs survive; abandoned sessions never leak.
+`ps` shows `idle=Ns/TTLs` per session.
+
 Run scripts look like `tests/flow.json` (key/type/click steps focus-sync first;
 assert_changed proves the UI is alive without hand-rolled PIL):
 

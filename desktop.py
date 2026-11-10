@@ -137,6 +137,28 @@ def drop_session(name: str) -> None:
         pass
 
 
+def session_ttl() -> float:
+    """Idle seconds after which a launched session is dead (BOAZ_TTL, default 60, 0 disables)."""
+    try:
+        v = float(os.environ.get("BOAZ_TTL", "60"))
+    except (TypeError, ValueError):
+        return 60.0
+    return max(v, 0.0)
+
+
+def session_idle_seconds(st: dict, now: float | None = None) -> float | None:
+    """Seconds since last use, or None when the session predates timestamps (exempt)."""
+    if "created_at" not in st and "last_used" not in st:
+        return None
+    if now is None:
+        now = time.time()
+    last = st.get("last_used", st.get("created_at", 0)) or 0
+    try:
+        return max(now - float(last), 0.0)
+    except (TypeError, ValueError):
+        return float("inf")
+
+
 def which_or_hint(candidates: list[str], label: str, hint: str) -> str:
     for c in candidates:
         if "/" in c:
