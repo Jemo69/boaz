@@ -4,6 +4,18 @@ Mishpat owns the browser; **boaz owns the desktop.** Launch Electron/GPUI/Qt/any
 X11 app on an invisible DISPLAY, drive it like an agent, read screenshots with
 vision. Your `:0` stays yours — boaz never touches it.
 
+## Install
+
+```bash
+sudo apt install -y xvfb xdotool ffmpeg scrot tesseract-ocr  # toolchain (boaz doctor verifies)
+git clone https://github.com/Jemo69/boaz.git ~/projects/boaz
+cd ~/projects/boaz && uv sync
+# shim (~/.local/bin/boaz):
+#   #!/bin/sh
+#   exec uv --directory /home/jemo/projects/boaz run python /home/jemo/projects/boaz/main.py "$@"
+boaz doctor   # must report X apps capturable
+```
+
 ```bash
 boaz launch "./my-app --no-sandbox" --name vp    # headless :99+, polls for a mapped window
 boaz launch "./gl-app" --name gl --with-wm xfwm4   # GL/wgpu/SDL/GPUI: compositor so paint reaches the framebuffer
